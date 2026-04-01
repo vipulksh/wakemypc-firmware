@@ -308,6 +308,32 @@ class WiFiManager:
             "rssi": rssi,
         }
 
+    def get_rssi(self):
+        """
+        Get the current WiFi signal strength (RSSI) in dBm.
+
+        RSSI = Received Signal Strength Indicator. It measures how strong
+        the WiFi signal is at the Pico's antenna, reported in dBm (decibels
+        relative to 1 milliwatt). It's always a negative number because the
+        signal is weaker than 1 milliwatt:
+
+            -30 dBm = Excellent (right next to the router)
+            -50 dBm = Good (same room, clear line of sight)
+            -67 dBm = Fair (through one wall)
+            -70 dBm = Weak (through multiple walls)
+            -80 dBm = Poor (far from router, expect connection drops)
+            -90 dBm = Barely usable (may disconnect frequently)
+
+        Returns:
+            int: RSSI in dBm, or 0 if not connected or unavailable.
+        """
+        if not self.is_connected():
+            return 0
+        try:
+            return self._wlan.status("rssi")
+        except Exception:
+            return 0
+
     def scan_networks(self):
         """
         Scan for available WiFi networks in range.

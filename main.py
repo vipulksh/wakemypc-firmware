@@ -325,6 +325,14 @@ def main():
     reconnect_delay = 1
     max_reconnect_delay = 60
 
+    # Track uptime and reconnections for health reporting.
+    # boot_ticks records the time.ticks_ms() value at startup so we can
+    # calculate how long the Pico has been running (uptime).
+    # reconnect_count tracks how many times we've had to reconnect -- a high
+    # number suggests WiFi instability or server issues.
+    boot_ticks = time.ticks_ms()
+    reconnect_count = 0
+
     # ---- Outer Loop: Retry on Failure ----
     while True:
         try:
@@ -406,15 +414,33 @@ def main():
                         )
 
                 # 5. Send heartbeat if it's time.
+                #    The heartbeat now includes health data so the server can
+                #    display a health dashboard (RAM usage, WiFi signal, uptime,
+                #    reconnection count). This data is stored in Redis cache on
+                #    the server and displayed on the transmitter detail page.
                 now = time.ticks_ms()
                 if time.ticks_diff(now, last_heartbeat) >= heartbeat_interval * 1000:
                     wifi_info = wifi.get_info() if wifi.is_connected() else None
-                    proto.send_heartbeat(wifi_info)
-                    last_heartbeat = now
 
-                    # Also run garbage collection periodically.
-                    # This helps prevent memory fragmentation on the tiny heap.
+                    # Collect garbage before measuring memory so we get an
+                    # accurate picture of actual memory usage (not just garbage
+                    # that hasn't been collected yet).
                     gc.collect()
+
+                    # Build health metrics to include with the heartbeat.
+                    # These let the server dashboard show the Pico's internal
+                    # state: how much RAM is free, WiFi signal quality, how
+                    # long it's been running, and how stable the connection is.
+                    health = {
+                        "free_ram": gc.mem_free(),
+                        "total_ram": gc.mem_free() + gc.mem_alloc(),
+                        "wifi_rssi": wifi.get_rssi() if hasattr(wifi, 'get_rssi') else None,
+                        "uptime_seconds": time.ticks_diff(time.ticks_ms(), boot_ticks) // 1000,
+                        "reconnect_count": reconnect_count,
+                    }
+
+                    proto.send_heartbeat(wifi_info, health)
+                    last_heartbeat = now
 
                 # 6. Check WebSocket health (ping/pong).
                 if not ws.check_heartbeat():
@@ -432,7 +458,8 @@ def main():
                     break  # Exit inner loop to reconnect.
 
             # If we exit the inner loop, something disconnected.
-            print("[main] Connection lost, will reconnect...")
+            reconnect_count += 1
+            print("[main] Connection lost, will reconnect... (reconnect #" + str(reconnect_count) + ")")
             led.set_pattern("error")
 
             # Clean up.

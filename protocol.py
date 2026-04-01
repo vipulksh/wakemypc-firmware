@@ -259,7 +259,7 @@ class ProtocolHandler:
             print("[proto] Failed to send response:", msg_type)
         return success
 
-    def send_heartbeat(self, wifi_info=None):
+    def send_heartbeat(self, wifi_info=None, health=None):
         """
         Send a periodic heartbeat to the server.
 
@@ -269,11 +269,19 @@ class ProtocolHandler:
         - WiFi signal strength
         - Memory usage
         - How many messages it's processed
+        - Health metrics (RAM, RSSI, uptime, reconnect count)
 
         The server uses this to:
         - Mark the device as "online" in the dashboard
-        - Monitor health metrics
+        - Monitor health metrics on the transmitter detail page
         - Detect if the Pico has rebooted (uptime resets)
+
+        Parameters:
+            wifi_info: Dict from WiFiManager.get_info() (SSID, IP, RSSI, etc.)
+            health:    Dict of health metrics from main.py (free_ram, total_ram,
+                       wifi_rssi, uptime_seconds, reconnect_count). These are
+                       stored in Redis cache on the server and displayed on the
+                       transmitter health dashboard.
         """
         # gc.mem_free() returns the number of free bytes on the heap.
         # gc.mem_alloc() returns the number of allocated bytes.
@@ -292,6 +300,13 @@ class ProtocolHandler:
         # Include WiFi info if provided.
         if wifi_info:
             heartbeat_data["wifi"] = wifi_info
+
+        # Include health metrics if provided.
+        # The server consumer stores these in Redis cache so the frontend
+        # can display a health dashboard with RAM usage, WiFi signal quality,
+        # uptime, and reconnection count.
+        if health:
+            heartbeat_data["health"] = health
 
         self.send_response("heartbeat", heartbeat_data)
 
