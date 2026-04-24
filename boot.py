@@ -116,6 +116,7 @@ except Exception as e:
 # - If you move the Pico to a new network, you need new WiFi credentials.
 # - If the device token is compromised, you can reset and re-register.
 # - If the Pico is stuck in a boot loop, factory reset clears bad config.
+# TODO Check what this does exactly, seems like it also stops the Pico from booting until you re-flash it? That would be a problem if we want to use BOOTSEL for something else in the future.
 try:
     import rp2
     if rp2.bootsel_button():
