@@ -186,6 +186,9 @@ class WebSocketClient:
         use_ssl = url.startswith("wss://")
         # Strip the scheme (ws:// or wss://).
         url = url.replace("wss://", "").replace("ws://", "")
+        # if the server url starts with http:// or https://, remove that as well
+        url = url.replace("https://", "").replace("http://", "")
+        # url used for ws:// and wss:// should not start with http:// or https://, but we handle it gracefully if it does
 
         # Split path from host.
         if "/" in url:

@@ -100,7 +100,7 @@ class WiFiManager:
         # The alternative is AP_IF (Access Point Interface), where the Pico
         # would CREATE a WiFi network for others to join.
         self._wlan = network.WLAN(network.STA_IF)
-
+        self._wlan.active(True)
         # Track which SSID we're connected to (None if not connected).
         self._current_ssid = None
 
@@ -141,8 +141,11 @@ class WiFiManager:
         # moment to power up and calibrate.
         time.sleep(1)
 
-        # Step 2: Try each network in order.
-        for net in wifi_networks:
+        # Step 2: Try each network in order by order key in dict.
+        if "order" not in wifi_networks[0]:
+            print("[wifi] WARNING: No 'order' key in wifi_networks config; using provided order but consider adding 'order' for explicit control.")
+        ordered_networks = sorted(wifi_networks, key=lambda x: x.get("order", 0))
+        for net in ordered_networks:
             ssid = net.get("ssid", "")
             password = net.get("password", "")
 

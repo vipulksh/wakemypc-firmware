@@ -134,6 +134,7 @@ def boot():
 
     # Check for essential config values.
     server_url = config.get("server_url", "")
+    ws_endpoint = config.get("ws_endpoint", "")
     wifi_networks = config.get("wifi_networks", [])
     device_token = config.get("device_token", "")
     device_id = config.get("device_id", "")
@@ -198,8 +199,8 @@ def boot():
     # ------------------------------------------------------------------
     print("\n[boot] Step 4: Connecting to WebSocket server...")
 
-    if not server_url:
-        print("[boot] Skipping WebSocket (no server URL configured)")
+    if not ws_endpoint:
+        print("[boot] Skipping WebSocket (no endpoint URL configured)")
         led.set_pattern("error")
         return {
             "config": config,
@@ -209,7 +210,7 @@ def boot():
             "proto": None,
         }
 
-    ws = WebSocketClient(server_url)
+    ws = WebSocketClient(ws_endpoint)
     ws_connected = ws.connect()
 
     if not ws_connected:
@@ -267,7 +268,7 @@ def boot():
     auth_message = {
         "type": "auth",
         "device_id": device_id,
-        "device_token": device_token,
+        "token": device_token,
         "hardware_id": hardware_id,
         "firmware_version": FIRMWARE_VERSION,
         "ip": wifi_info["ip"] if wifi_info else "unknown",

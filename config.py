@@ -16,7 +16,8 @@ Our configuration is stored in a file called "secrets.json" on this filesystem.
 It contains:
   - wifi_networks: A list of {ssid, password} dicts (so the Pico can try
     multiple WiFi networks -- useful if you move it between home and office)
-  - server_url: The WebSocket URL of your Django server
+  - ws_endpoint: The WebSocket endpoint URL for this Pico to connect to the server
+  - server_url: The base URL of the server (used for API calls, etc.)
   - device_token: An authentication token so the server knows this Pico is legit
   - device_id: A unique identifier for this specific Pico device
 
@@ -66,11 +67,13 @@ DEFAULT_CONFIG = {
     # Each entry is a dict with "ssid" (network name) and "password".
     # The Pico will try each one until it connects successfully.
     "wifi_networks": [],
-    # The WebSocket URL of your Django server.
-    # Example: "wss://yourserver.com/ws/pico/"
-    # "wss://" means WebSocket Secure (encrypted with TLS).
+    # The Server URL of your Django server.
+    # "https://" means  Secure (encrypted with TLS).
     # "ws://" means unencrypted (only use for local development).
     "server_url": "",
+    # The WebSocket endpoint URL for this Pico to connect to the server.
+    # Example: "wss://yourserver.com/ws/pico/"
+    "ws_endpoint": "",
     # Authentication token -- the server gives you this when you register
     # a new Pico device. It proves this Pico is authorized to connect.
     "device_token": "",
