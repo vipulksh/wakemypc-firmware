@@ -763,14 +763,13 @@ class ProtocolHandler:
         Handle reboot request.
 
         Server sends: {"type": "reboot"}
-        We acknowledge, then reboot the Pico.
-
-        ABOUT machine.reset():
-        This performs a hard reset of the Pico -- equivalent to unplugging
-        and re-plugging it. All RAM is cleared, all connections are dropped,
-        and boot.py + main.py run again from scratch.
+        We acknowledge, then reboot the Pico via reboot.hard_reset(),
+        which power-cycles the CYW43 chip before machine.reset() so the
+        new boot doesn't inherit a stale WiFi association. Bare
+        machine.reset() leaves the radio chip warm and is the path that
+        produced the v0.3.2-era post-reboot stuck-WiFi loop.
         """
-        import machine
+        from reboot import hard_reset
 
         # Send acknowledgment BEFORE rebooting.
         proto.send_response("reboot_ack", {"message": "Rebooting now"})
@@ -778,10 +777,8 @@ class ProtocolHandler:
         # Small delay to ensure the response is sent.
         time.sleep(1)
 
-        # Reboot!
-        # machine.reset() never returns -- the Pico restarts immediately.
         print("[proto] Rebooting...")
-        machine.reset()
+        hard_reset("server_reboot")
 
     def _handle_get_status(self, message, proto):
         """

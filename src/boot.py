@@ -140,9 +140,11 @@ try:
         time.sleep(1)
         led.on()
         time.sleep(1)
-        # machine.reset() is a hard reboot -- equivalent to unplugging and
-        # re-plugging the Pico. After this, boot.py runs again from scratch.
-        machine.reset()
+        # reboot.hard_reset cycles GPIO 23 (CYW43 WL_REG_ON) low before
+        # machine.reset() so the new boot starts with a freshly powered
+        # radio. boot.py runs again from scratch.
+        from reboot import hard_reset
+        hard_reset("factory_reset")
 except Exception as e:
     # rp2.bootsel_button() may not exist on all boards.
     # Non-fatal: if we can't check, just skip the factory reset feature.

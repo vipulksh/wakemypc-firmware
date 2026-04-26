@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.3.4"
+FIRMWARE_VERSION = "0.3.5"
 
 
 # -------------------------------------------------------------------------
@@ -384,6 +384,29 @@ def main():
         # If we exit the inner loop, something broke. Wait and retry.
         time.sleep(backoff_delay)
     """
+    # Post-reset settling delay (HARD_RESET only).
+    #
+    # When a host serial reader (wakemypc logs in old CLI versions, plain
+    # `screen`/`minicom`, etc.) reattaches right after machine.reset(),
+    # opening the USB CDC port asserts DTR/RTS by default and can pulse
+    # the rp2 USB stack hard enough to interrupt MicroPython before
+    # main.py finishes loading. The result is a Pico parked in REPL with
+    # no WiFi -- the bug we chased through firmware v0.3.2-v0.3.4 before
+    # tracing it back to the host side.
+    #
+    # CLI v1.0.3+ no longer triggers this, but plenty of older hosts
+    # are out there. Sleeping ~1s here, gated to the HARD_RESET cause,
+    # gives any reasonable serial reader time to re-enumerate and
+    # quiesce its DTR/RTS handling before we start printing. Cold boots
+    # (PWRON_RESET) skip the wait so first plug-in is unaffected.
+    try:
+        import machine as _m
+
+        if _m.reset_cause() == getattr(_m, "HARD_RESET", -1):
+            time.sleep(1)
+    except Exception:
+        pass
+
     # Initialize the watchdog.
     # We create it outside the loop so it persists across reconnections.
     # (Remember: once started, the hardware WDT can't be stopped!)
@@ -826,11 +849,12 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print("FATAL ERROR in main():", e)
-        # The watchdog (if started) will reboot us.
-        # If the watchdog hasn't started yet, we just sit here. :(
-        # In production, you might want to add a machine.reset() here
-        # as a fallback, but be careful about boot loops.
+        # The watchdog (if started) will reboot us. If we can reach
+        # this line we may as well give the radio a clean restart too:
+        # reboot.hard_reset() pulls WL_REG_ON low so the next boot's
+        # WiFi isn't inheriting a stale CYW43 state from the crashed
+        # session.
         time.sleep(10)
-        import machine
+        from reboot import hard_reset
 
-        machine.reset()
+        hard_reset("fatal_main")
