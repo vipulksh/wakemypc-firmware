@@ -119,6 +119,19 @@ class ProtocolHandler:
         # without coupling them to this class.
         self._on_auth_ok = None
 
+        # Optional callback fired when the server asks us to emit a heartbeat
+        # right now (request_heartbeat message). main.py wires this so the
+        # heartbeat carries the same wifi + health metrics the regular 30s
+        # heartbeat does -- protocol alone doesn't have access to the Wi-Fi
+        # manager or the health collector.
+        self._on_request_heartbeat = None
+
+        # Optional callback fired when the server pushes a new wifi_networks
+        # list. main.py wires this so the wifi_manager can immediately try
+        # to reconnect with the new networks instead of waiting for the next
+        # connection failure.
+        self._on_wifi_config_set = None
+
         # Register built-in handlers that don't depend on external modules.
         self._register_builtins()
 
@@ -154,6 +167,21 @@ class ProtocolHandler:
         # bounce an "error: unknown type" message back to the server every
         # 30 seconds.
         self._handlers["pong"] = self._handle_pong
+
+        # "request_heartbeat" -- server is asking the firmware to emit a
+        # full heartbeat right now (rather than waiting for the next 30s
+        # tick). The dashboard's "Refresh now" button on the transmitter
+        # detail page triggers this. We respond by sending a heartbeat
+        # message with current health metrics.
+        self._handlers["request_heartbeat"] = self._handle_request_heartbeat
+
+        # "wifi_config_get" / "wifi_config_set" -- the dashboard's
+        # transmitter page lets the user view + edit the WiFi networks
+        # this Pico will connect to. Credentials live ONLY on the Pico
+        # (never persisted server-side); the server merely relays the
+        # request to us and our reply back to the dashboard.
+        self._handlers["wifi_config_get"] = self._handle_wifi_config_get
+        self._handlers["wifi_config_set"] = self._handle_wifi_config_set
 
     def register(self, message_type, handler_func):
         """
@@ -411,6 +439,119 @@ class ProtocolHandler:
         only starts polling once the server has told us what to monitor.
         """
         self._on_auth_ok = callback
+
+    def _handle_request_heartbeat(self, message, proto):
+        """
+        Server (via the dashboard's "Request heartbeat now" button) is
+        asking us to emit a full heartbeat right now instead of waiting
+        for the next 30s tick.
+
+        We delegate to a callback that main.py registers with
+        set_on_request_heartbeat() -- main.py owns the wifi_manager and
+        health collector, so it builds the wifi_info + health dicts and
+        calls send_heartbeat(...). If no callback is registered, fall
+        back to a bare heartbeat that at least bumps last_seen.
+        """
+        if self._on_request_heartbeat is not None:
+            try:
+                self._on_request_heartbeat()
+                return
+            except Exception as exc:
+                print("[proto] on_request_heartbeat callback raised:", exc)
+        # Fallback: bare heartbeat with no health info.
+        self.send_heartbeat()
+
+    def set_on_request_heartbeat(self, callback):
+        """
+        Register a no-arg callable that fires a full heartbeat (with
+        wifi + health) on demand. main.py wires this so the dashboard's
+        "refresh now" button gets up-to-date metrics, not just a liveness
+        bump.
+        """
+        self._on_request_heartbeat = callback
+
+    def _handle_wifi_config_get(self, message, proto):
+        """
+        Dashboard wants to view the WiFi networks this Pico is configured
+        for. Server sends {"type": "wifi_config_get"}; we reply with
+        {"type": "wifi_config", "networks": [...]} which the server's
+        _handle_wifi_config (consumers.py) relays to the user's group.
+
+        SECURITY: passwords are NEVER returned. We strip them and send
+        a "password_set" boolean instead -- the dashboard can show "***"
+        for entries that have a password without seeing the password.
+        """
+        networks = self._config.get("wifi_networks", []) or []
+        sanitized = []
+        for net in networks:
+            sanitized.append(
+                {
+                    "ssid": net.get("ssid", ""),
+                    "order": net.get("order", 0),
+                    "password_set": bool(net.get("password")),
+                }
+            )
+        proto.send_response("wifi_config", {"networks": sanitized})
+
+    def _handle_wifi_config_set(self, message, proto):
+        """
+        Dashboard pushed a new list of WiFi networks. Replace what we
+        have, persist to flash, optionally tell main.py to reconnect.
+
+        Server sends:
+            {"type": "wifi_config_set",
+             "networks": [{"ssid": "...", "password": "...", "order": 0}, ...]}
+
+        We reply:
+            {"type": "wifi_config_set_ok"}    on success
+            {"type": "error", "message": ...} on failure (the existing
+                                              error path in dispatch()
+                                              handles uncaught exceptions)
+        """
+        networks = message.get("networks") or []
+        # Trust the server's payload shape but coerce defensively -- the
+        # dashboard could send malformed data and we don't want to brick
+        # WiFi by saving garbage.
+        clean = []
+        for net in networks:
+            if not isinstance(net, dict):
+                continue
+            ssid = net.get("ssid")
+            if not ssid:
+                continue
+            clean.append(
+                {
+                    "ssid": ssid,
+                    "password": net.get("password", ""),
+                    "order": net.get("order", 0),
+                }
+            )
+
+        self._config.set("wifi_networks", clean)
+        if not self._config.save():
+            proto.send_response(
+                "error",
+                {"message": "Failed to save wifi_networks to flash."},
+            )
+            return
+
+        # Optionally hand off to main.py so wifi_manager re-connects with
+        # the new list immediately rather than at next disconnect.
+        if self._on_wifi_config_set is not None:
+            try:
+                self._on_wifi_config_set(clean)
+            except Exception as exc:
+                print("[proto] on_wifi_config_set callback raised:", exc)
+
+        proto.send_response("wifi_config_set_ok", {"count": len(clean)})
+
+    def set_on_wifi_config_set(self, callback):
+        """
+        Register a callable that runs after a successful wifi_config_set,
+        with the cleaned list. main.py uses this to nudge the wifi_manager
+        toward the new networks.
+        """
+        self._on_wifi_config_set = callback
 
     def _handle_config_update(self, message, proto):
         """
