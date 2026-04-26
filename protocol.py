@@ -502,6 +502,19 @@ class ProtocolHandler:
             {"type": "wifi_config_set",
              "networks": [{"ssid": "...", "password": "...", "order": 0}, ...]}
 
+        Password handling:
+          - If a network entry HAS a "password" key, use it verbatim
+            (including empty string -- means "open network / clear it").
+          - If the entry has NO "password" key at all, KEEP whatever
+            password is already on flash for that SSID. The dashboard
+            never sees existing passwords (we strip them on get), so
+            it can't echo them back; it omits the key to mean
+            "leave it alone."
+
+        Without this preservation step, reordering networks or adding
+        a new one would silently wipe every existing password the
+        dashboard didn't re-enter.
+
         We reply:
             {"type": "wifi_config_set_ok"}    on success
             {"type": "error", "message": ...} on failure (the existing
@@ -509,6 +522,15 @@ class ProtocolHandler:
                                               handles uncaught exceptions)
         """
         networks = message.get("networks") or []
+
+        # Build a lookup of currently-saved passwords keyed by SSID, so
+        # we can fill in entries where the dashboard omitted "password".
+        existing_pw = {}
+        for n in self._config.get("wifi_networks", []) or []:
+            ssid = n.get("ssid")
+            if ssid:
+                existing_pw[ssid] = n.get("password", "")
+
         # Trust the server's payload shape but coerce defensively -- the
         # dashboard could send malformed data and we don't want to brick
         # WiFi by saving garbage.
@@ -519,10 +541,16 @@ class ProtocolHandler:
             ssid = net.get("ssid")
             if not ssid:
                 continue
+            if "password" in net:
+                # Explicit -- use whatever was sent (including "").
+                password = net.get("password", "")
+            else:
+                # Omitted -- keep whatever we have on flash, or "" for new SSIDs.
+                password = existing_pw.get(ssid, "")
             clean.append(
                 {
                     "ssid": ssid,
-                    "password": net.get("password", ""),
+                    "password": password,
                     "order": net.get("order", 0),
                 }
             )
