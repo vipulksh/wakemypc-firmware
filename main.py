@@ -393,10 +393,12 @@ def main():
                 msg = ws.recv()
 
                 if msg is not None:
-                    # Flash the LED to acknowledge the message.
-                    led.flash_ack()
-
-                    # Dispatch to the appropriate handler.
+                    # Dispatch to the appropriate handler. We deliberately
+                    # do NOT blink the LED here -- a heartbeat-driven blink
+                    # every 30s on the same pin/pattern as the "error"
+                    # flash looked like the Pico was misbehaving. The LED
+                    # is reserved for actual state changes (connecting,
+                    # connected, error) and the "identify" command.
                     proto.dispatch(msg)
 
                 # 4. Poll TCP relay sessions.
