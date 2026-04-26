@@ -1,41 +1,40 @@
-## v0.3.3 — survive warm reboot (post-OTA WiFi recovery)
+## v0.3.4 — hard-reset the CYW43 chip before post-OTA reboot
 
-**Critical fix.** After v0.3.2 successfully OTA'd a Pico, the device
-would reboot into v0.3.2 and then fail to reconnect to WiFi -- stuck
-in a loop of `Timeout connecting to <SSID>` followed by an 8s WDT
-reset, until the user power-cycled it manually. v0.3.3 fixes this.
+**The actual fix for v0.3.2's stuck-after-OTA loop.** v0.3.3 tried to
+solve the warm-reboot WiFi issue by toggling `wlan.active(False)` ->
+`active(True)` at the start of `connect()`. That was not deep enough --
+on the rp2 MicroPython build, `active(False)` doesn't fully drop power
+to the CYW43 chip. The chip's state machine survived, the warm-boot
+WiFi failure persisted, and the watchdog still fired ~8s into the
+retry boot.
 
-**Root cause.** The CYW43 WiFi chip on the Pico W lives on a separate
-power domain from the RP2040. `machine.reset()` (used by the OTA
-pipeline to load new code) only resets the RP2040; the CYW43 keeps
-its previous session state. The next boot's `wlan.connect()` finds
-the chip still convinced it owns the old SSID, refuses to scan or
-re-associate cleanly, and times out. Power-cycling fixes it because
-that drops chip power; soft reset doesn't.
+v0.3.4 yanks the chip's power-enable pin (GPIO 23, wired to
+`WL_REG_ON` on the Pico W) low for 500ms right before
+`machine.reset()`. This is a true hardware reset of the WiFi chip --
+the same effect as a USB power cycle, just for the radio. When the
+new firmware boots, the chip is freshly powered and re-initializes
+clean, so `wlan.connect()` succeeds in the normal sub-second window.
 
-**Fix.** [wifi_manager.connect()](src/wifi_manager.py) now toggles
-`active(False) -> sleep(0.5) -> active(True)` at the start of every
-attempt. That drives the chip's power-management pin and forces a
-clean re-init -- the equivalent of toggling WiFi off/on in an OS
-settings panel. Cheap on cold boot (radio was already off), essential
-on warm boot.
+**Where the fix lives:** [ota_updater.handle_ota_update](src/ota_updater.py),
+right before the `machine.reset()` call. Only fires on the post-OTA
+reboot path -- normal cold boots are unaffected, since they don't
+have the warm-chip problem to begin with.
 
-**Apply path.**
+**Apply path:**
 
-If you're already on a working v0.3.1 or v0.3.2, OTA to v0.3.3 should
-work end-to-end now (the WDT-during-OTA fix landed in v0.3.2 already).
+If you're already on a working v0.3.1 or v0.3.2, OTA to v0.3.4 should
+work end-to-end. The OTA itself is the same as before; the new code
+just runs in the final two lines before reset.
 
-If your Pico is currently *stuck* in the post-v0.3.2 reboot loop, OTA
-won't recover it -- the WS connection never establishes. USB-flash to
-escape:
+If your Pico is *currently* stuck in the post-v0.3.2 reboot loop,
+USB-flash to recover -- OTA can't reach a Pico that never associates
+with WiFi.
 
 ```
 wakemypc upload --firmware-dir ./pico_firmware/src/
 ```
 
-After USB recovery, future updates flow over OTA normally.
-
 ```
 docker compose -f docker-compose.local.yml exec django \
-  python manage.py import_firmware_manifest 0.3.3 --mark-latest
+  python manage.py import_firmware_manifest 0.3.4 --mark-latest
 ```

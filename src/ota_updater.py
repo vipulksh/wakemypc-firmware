@@ -763,6 +763,30 @@ def handle_ota_update(message, proto):
 
         print("[ota] Rebooting to apply update...")
         time.sleep(2)
+
+        # Power-cycle the CYW43 WiFi chip before resetting the RP2040.
+        #
+        # WHY: machine.reset() only resets the RP2040 -- the CYW43 sits on
+        # a separate power domain and keeps its previous association state
+        # across the reset. The newly booted firmware then can't connect
+        # to WiFi (the chip thinks it still owns the SSID and refuses to
+        # re-associate), the boot loop's watchdog fires at 8s, and the
+        # device gets stuck in a reboot loop until somebody power-cycles
+        # the USB. wlan.active(False) is supposed to drop chip power but
+        # in practice doesn't go deep enough on the rp2 build.
+        #
+        # GPIO 23 is wired to WL_REG_ON on the Pico W -- the chip's
+        # power-enable pin. Pulling it low for 500ms forces the chip into
+        # full reset. The MicroPython startup will re-init it on the next
+        # boot, giving us a freshly cold chip even though we soft-reset
+        # the CPU. Wrapped in try/except because GPIO 23 is Pico-W
+        # specific; a future port to plain Pico (no WiFi) would skip this.
+        try:
+            machine.Pin(23, machine.Pin.OUT).value(0)
+            time.sleep(0.5)
+        except Exception as exc:
+            print("[ota] CYW43 power-cycle skipped:", exc)
+
         machine.reset()
 
 
