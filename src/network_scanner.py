@@ -194,6 +194,7 @@ class NetworkScanner:
         if not ip:
             return result
 
+        name = target.get("name") or ip
         for p, label in ((port, "primary"), (22, "fallback")):
             if p == port and label == "fallback":
                 continue
@@ -226,6 +227,8 @@ class NetworkScanner:
             except Exception:
                 continue
 
+        status = "online" if result["online"] else "offline"
+        print("[scanner]", name, "->", status)
         return result
 
     def check_device(self, ip, ports=None):
@@ -395,23 +398,28 @@ class NetworkScanner:
             if not ip:
                 continue
 
-            print("[scanner] Checking", target.get("name", ip), "(", ip, ")")
+            name = target.get("name", ip)
+            print("[scanner] Checking", name, "(", ip, ")")
+            t_start = time.ticks_ms()
 
-            # Check the device.
             result = self.check_device(ip, ports=quick_ports)
 
-            # Forward all input metadata to the result. We previously only
-            # copied "name" and "mac"; that dropped public_id, which the
-            # server-side _handle_device_status keys off. Without public_id
-            # the server doesn't know which Device row to update and the
-            # dashboard's online/offline dot stays stuck.
+            elapsed = time.ticks_diff(time.ticks_ms(), t_start)
+            status = "ONLINE" if result["online"] else "offline"
+            port_str = str(result.get("port", "-"))
+            print(
+                "[scanner]", name, "->", status,
+                "| port=", port_str,
+                "| rt=", result.get("response_time_ms", "-"), "ms",
+                "| took=", elapsed, "ms",
+            )
+
             result["name"] = target.get("name", "")
             result["mac"] = target.get("mac", "")
             result["public_id"] = target.get("public_id", "")
 
             results.append(result)
 
-            # Brief pause between devices to avoid overwhelming the network.
             time.sleep(0.1)
 
         return results

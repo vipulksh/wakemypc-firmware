@@ -145,7 +145,19 @@ class Config:
                 # in a firmware update, the default value is used.
                 if isinstance(loaded, dict):
                     self._data.update(loaded)
+                    # Print config summary with secrets masked so the log
+                    # shows what's configured without leaking credentials.
+                    # Masked fields: device_token, wifi passwords.
+                    wifi_ssids = [
+                        n.get("ssid", "?")
+                        for n in self._data.get("wifi_networks", [])
+                    ]
                     print("[config] Loaded from", filename)
+                    print("[config]   device_id  =", self._data.get("device_id", "(none)"))
+                    print("[config]   server_url =", self._data.get("server_url", "(none)"))
+                    print("[config]   ws_endpoint=", self._data.get("ws_endpoint", "(none)"))
+                    print("[config]   wifi_ssids =", wifi_ssids)
+                    print("[config]   token      = ***masked***")
                     return True
 
             except OSError:

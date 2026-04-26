@@ -1,16 +1,40 @@
-## v0.2.0 — Staggered scans + log ring buffer
+## v0.2.1 — Debug build
 
-**Performance:**
-- **Round-robin device scans.** The previous behaviour probed every
-  managed device in the same main-loop iteration, blocking up to 8s
-  per offline device (4 ports × 2s timeout). With three offline
-  devices that was 24s of blocking per scan -- past the watchdog and
-  heartbeat windows. Now the loop probes one device per tick at
-  `scan_interval / N` spacing; each tick blocks for at most ~1-2s.
-- **Single-port probe with early return** (`NetworkScanner.check_one`):
-  port 80 first, port 22 fallback, 1s timeout. Stops on the first
-  conclusive answer.
+A diagnostic-focused release built specifically to trace what happens
+when a Pico is asked to monitor several devices at once.
 
-**Debug:**
-- New **`log_buffer`** module: every `print()` is teed into both
-  serial and an in-RAM 200-line ring buffer.
+**Reverted (intentionally):**
+- The round-robin scan stagger from v0.2.0 is **temporarily reverted**
+  in this build. The all-at-once scan is back so the overload bug can
+  be reproduced and observed live in `wakemypc logs`.
+
+**New debug instrumentation:**
+- `config.py` prints the loaded config on boot (device_id, server_url,
+  ws_endpoint, configured SSIDs). Secrets are masked: device_token is
+  printed as `***masked***`, WiFi passwords are never logged.
+- `main.py` heartbeat tick prints uptime / free RAM / WiFi RSSI /
+  reconnect count.
+- `main.py` scan loop prints `[main] scan START | N device(s) | forced=…`
+  and `[main] scan END | <ms> ms | <online>/<total> online` so a slow
+  scan is visible as a long gap between START and END.
+- `network_scanner.check_devices` prints per-device timing
+  (`[scanner] <name> -> ONLINE | port= 80 | rt= 7 ms | took= 12 ms`).
+- `ws_client.send` prints message type + size on every outbound frame.
+
+**OTA:**
+- The Pico now fetches `MANIFEST.json` directly from the GitHub
+  Release referenced by `manifest_url` in the `ota_update` message
+  (instead of the server embedding the file list inline). Single
+  source of truth across server + Pico.
+- Post-install hook support: a manifest entry with
+  `"post_install": true` runs after the file swap; `"delete_after": true`
+  removes the hook from flash. For `secrets.json` migrations on
+  breaking releases.
+
+**CLI:**
+- `wakemypc logs` filters high-frequency lines by default (heartbeat
+  metrics, per-probe timing, per-message dispatch). Pass `--debug` for
+  the full firehose.
+- `wakemypc upload --firmware-dir <path>` auto-falls-through to a
+  `src/` subdirectory so passing the parent dir works without knowing
+  the internal layout.

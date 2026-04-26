@@ -419,6 +419,33 @@ class OTAUpdater:
 
         print("[ota] Update complete.", len(updated), "files updated")
 
+        # PHASE 4: Run post-install hooks.
+        # A hook is any file in the manifest with "post_install": true.
+        # Use case: secrets.json migrations when a release renames or adds
+        # required config keys. The hook reads secrets.json, transforms it,
+        # writes it back. If "delete_after" is also true, the file is removed
+        # from flash after it runs so it doesn't waste space or re-run.
+        for file_info in safe_files:
+            if not file_info.get("post_install"):
+                continue
+            hook_file = file_info["filename"]
+            print("[ota] Running post-install hook:", hook_file)
+            try:
+                # Import by stripping .py, run its run() function.
+                module_name = hook_file.replace(".py", "").replace("/", "_")
+                hook_mod = __import__(module_name)
+                if hasattr(hook_mod, "run"):
+                    hook_mod.run()
+                print("[ota] Hook completed:", hook_file)
+            except Exception as e:
+                print("[ota] Hook error:", hook_file, ":", e)
+            if file_info.get("delete_after"):
+                try:
+                    os.remove(hook_file)
+                    print("[ota] Deleted hook:", hook_file)
+                except OSError:
+                    pass
+
         return {
             "success": len(updated) == len(safe_files),
             "message": "Updated {} of {} files".format(len(updated), len(safe_files)),
@@ -449,40 +476,86 @@ class OTAUpdater:
         return versions
 
 
-def handle_ota_update(message, proto):
-    """
-    Protocol handler for OTA update commands.
+def fetch_manifest(manifest_url):
+    """Download and parse MANIFEST.json from a GitHub Release URL.
 
-    Expected message:
+    Returns a list of {"filename", "url", "checksum"} dicts ready for
+    OTAUpdater.update(), or raises an Exception on failure.
+
+    The GitHub Actions release workflow (release.yml) builds this file
+    automatically when a version tag is pushed. It is the single source
+    of truth for what files ship in each release -- the server reads it,
+    and now the Pico reads it directly so both sides agree without the
+    server having to embed the full file list in every OTA message.
+    """
+    success, error = http_download(manifest_url, "/tmp_manifest.json")
+    if not success:
+        raise Exception("Failed to download manifest: " + str(error))
+
+    try:
+        with open("/tmp_manifest.json") as f:
+            raw = json.loads(f.read())
+    finally:
+        try:
+            os.remove("/tmp_manifest.json")
+        except OSError:
+            pass
+
+    files = []
+    for entry in raw.get("files", []):
+        filename = entry.get("path", "")
+        url = entry.get("url", "")
+        checksum = entry.get("sha256", "")
+        if filename and url and checksum:
+            files.append({"filename": filename, "url": url, "checksum": checksum})
+
+    return files
+
+
+def handle_ota_update(message, proto):
+    """Protocol handler for OTA update commands.
+
+    The server can send the update in two ways:
+
+    Preferred -- manifest_url (server points at GitHub Release):
         {
             "type": "ota_update",
-            "files": [
-                {
-                    "filename": "main.py",
-                    "url": "https://server.com/firmware/main.py",
-                    "checksum": "abc123..."
-                },
-                ...
-            ]
+            "version": "0.2.1",
+            "manifest_url": "https://github.com/.../releases/download/v0.2.1/MANIFEST.json"
+        }
+        The Pico fetches MANIFEST.json from GitHub, verifies each file's
+        sha256, and swaps them in. The manifest is the single source of
+        truth -- both the server and the Pico read from the same file so
+        there is no risk of the server embedding a stale or mismatched list.
+
+    Legacy -- inline files list (still accepted for backward compat):
+        {
+            "type": "ota_update",
+            "files": [{"filename": "main.py", "url": "...", "checksum": "..."}, ...]
         }
 
     Response:
-        {
-            "type": "ota_result",
-            "success": true/false,
-            "message": "...",
-            "updated": ["main.py", "wol.py"]
-        }
+        {"type": "ota_result", "success": true/false, "message": "...",
+         "updated": ["main.py", ...]}
     """
+    manifest_url = message.get("manifest_url")
     files = message.get("files", [])
+
+    if manifest_url:
+        print("[ota] Fetching manifest from", manifest_url)
+        try:
+            files = fetch_manifest(manifest_url)
+        except Exception as e:
+            proto.send_response(
+                "ota_result",
+                {"success": False, "message": "Manifest fetch failed: " + str(e)},
+            )
+            return
 
     if not files:
         proto.send_response(
             "ota_result",
-            {
-                "success": False,
-                "message": "No files specified",
-            },
+            {"success": False, "message": "No files in manifest"},
         )
         return
 
@@ -491,12 +564,11 @@ def handle_ota_update(message, proto):
 
     proto.send_response("ota_result", result)
 
-    # If the update was successful, reboot to load the new code.
     if result["success"]:
         import machine
 
         print("[ota] Rebooting to apply update...")
-        time.sleep(2)  # Give the response time to send.
+        time.sleep(2)
         machine.reset()
 
 

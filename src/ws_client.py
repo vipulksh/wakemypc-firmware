@@ -414,6 +414,13 @@ class WebSocketClient:
 
             # Send header + masked payload.
             self._sock.send(bytes(header) + bytes(masked_data))
+            msg_type = ""
+            if isinstance(data, (bytes, bytearray)):
+                try:
+                    msg_type = json.loads(data).get("type", "?")
+                except Exception:
+                    pass
+            print("[ws] Sent:", msg_type, "(", length, "bytes )")
             return True
 
         except Exception as e:
