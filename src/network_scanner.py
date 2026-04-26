@@ -123,6 +123,111 @@ class NetworkScanner:
         self._timeout = timeout
         self._ports = ports or DEFAULT_PROBE_PORTS
 
+    def check_one(self, target, port=80, timeout=1):
+        """Single TCP probe of one device. Returns the same result shape
+        as check_device() but bails on the first conclusive answer
+        (port open, or connection refused -- both prove the host is up).
+
+        ====================================================================
+        WHY THIS EXISTS -- the "Pico is overloading with 3 devices" bug
+        ====================================================================
+        The periodic scanner originally called check_device() for every
+        assigned device in a single main-loop iteration. check_device()
+        walks the full DEFAULT_PROBE_PORTS list (or quick_ports in batch
+        mode -- still 4 ports), with NO early-return when a port responds.
+        Each port has a 2s socket timeout.
+
+        Cost calculation that nobody did before shipping:
+
+            offline-device cost = ports * timeout = 4 * 2s = 8 seconds
+            three offline devices = 3 * 8s = 24 seconds in ONE loop tick
+
+        During those 24 seconds the Pico cannot:
+          - feed its 8-second hardware watchdog (it resets the chip)
+          - reply to a heartbeat (server stale-sweep marks it offline
+            after 90s of silence)
+          - dispatch incoming WebSocket messages (WoL commands, OTA
+            triggers, identify, reboot all back up)
+          - poll TCP relay sessions (active SSH tunnels stall and
+            usually drop)
+
+        Symptom the user reported: "Pico might be overloading when I
+        set it to manage 3 devices, and the check for the three was
+        triggering together." Exactly right -- all three probes ran
+        back-to-back in one tick, blowing the watchdog budget and
+        starving every other responsibility.
+
+        ====================================================================
+        THE FIX (this method + the round-robin scheduler in main.py)
+        ====================================================================
+        1. Single port + early return: if port 80 responds (or refuses,
+           which still proves the host is up), we report online and
+           stop. One probe per device per cycle, as the user asked.
+        2. Short timeout (1s) instead of 2s: home LANs respond in
+           <100ms; 1s is plenty of headroom and halves the worst case.
+        3. Two-port fallback (22 if 80 silent): catches Linux boxes
+           with no web server. Worst case: 2 * 1s = 2s per device.
+        4. Stagger across ticks (in main.py): probe ONE device per
+           tick at scan_interval/N spacing, not all N in one tick.
+           With 3 devices and the default 60s interval that's one
+           probe every 20s -- and each tick blocks for at most ~2s.
+
+        Net result: blocking dropped from 24s to ~2s worst case,
+        comfortably below the 8s watchdog and 30s heartbeat windows.
+
+        Multi-port fallback: if the first port times out (could be a
+        device with that port firewalled but otherwise online), we try
+        a single secondary port. Two probes worst case = 2*timeout.
+        """
+        ip = target.get("ip")
+        result = {
+            "ip": ip,
+            "online": False,
+            "response_time_ms": None,
+            "port": None,
+            "service": None,
+            "open_ports": [],
+            "name": target.get("name", ""),
+            "mac": target.get("mac", ""),
+            "public_id": target.get("public_id", ""),
+        }
+        if not ip:
+            return result
+
+        for p, label in ((port, "primary"), (22, "fallback")):
+            if p == port and label == "fallback":
+                continue
+            start = time.ticks_ms()
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                try:
+                    sock.connect((ip, p))
+                    result["online"] = True
+                    result["port"] = p
+                    result["service"] = "open"
+                    result["response_time_ms"] = time.ticks_diff(
+                        time.ticks_ms(), start
+                    )
+                    result["open_ports"].append(p)
+                    return result
+                except OSError as e:
+                    err = str(e)
+                    if "ECONNREFUSED" in err or "111" in err:
+                        result["online"] = True
+                        result["port"] = p
+                        result["service"] = "refused"
+                        result["response_time_ms"] = time.ticks_diff(
+                            time.ticks_ms(), start
+                        )
+                        return result
+                finally:
+                    sock.close()
+            except Exception:
+                continue
+
+        return result
+
     def check_device(self, ip, ports=None):
         """
         Check if a single device is online by probing its TCP ports.

@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.1.1"
+FIRMWARE_VERSION = "0.2.0"
 
 
 # -------------------------------------------------------------------------
@@ -115,6 +115,17 @@ def boot(reuse=None):
     3. Better for memory (local variables are freed after the function returns,
        unless we explicitly return them)
     """
+    # Activate the in-RAM log ring buffer -- print() now tees to both
+    # serial and a capped-size buffer so `wakemypc logs --debug` can
+    # snapshot recent output even if it wasn't streaming live at the
+    # time. Idempotent on partial reboots.
+    try:
+        from log_buffer import install as _install_log_buffer
+
+        _install_log_buffer()
+    except ImportError:
+        pass
+
     # Skip the noisy banner on a partial reboot -- the user log already
     # shows the previous one, and a fresh one looks like a hard reset
     # (which it isn't).
@@ -423,12 +434,23 @@ def main():
             # responsive, high enough to not melt a Pico that's
             # monitoring 10+ devices.
             device_scan_interval = config.get("device_scan_interval", 60)
-            # Wrapped in a dict so the device_assignment callback below
-            # can flip `force` from outside the loop's scope. MicroPython
-            # supports `nonlocal` but dict mutation is the simpler idiom.
-            scan_state = {"last": time.ticks_ms(), "force": False}
+            # Round-robin scan: one device per tick, ticks evenly spread
+            # across device_scan_interval. With 3 devices and the default
+            # 60s interval that's one device every 20s, single 1s probe
+            # each. Worst-case main-loop block per tick is one timeout
+            # rather than N * timeout, which is what was overloading the
+            # Pico when the user assigned 3 devices.
+            scan_state = {
+                "last": time.ticks_ms(),
+                "force": False,
+                "cursor": 0,
+            }
 
             def _force_scan_on_assignment(_devices):
+                # Reset cursor + flag a forced tick so a freshly assigned
+                # device gets probed at the head of the new cycle, not
+                # whichever index the cursor happened to be on.
+                scan_state["cursor"] = 0
                 scan_state["force"] = True
 
             proto.set_on_device_assignment(_force_scan_on_assignment)
@@ -505,40 +527,50 @@ def main():
                     proto.send_heartbeat(wifi_info, health)
                     last_heartbeat = now
 
-                # 5b. Periodic device-status scan.
-                #     Walk the assigned-devices list, TCP-probe each,
-                #     emit one `device_status` message with all results.
-                #     The server's _handle_device_status keys off public_id
-                #     to update the per-device online/offline cache that
-                #     drives the dashboard's status indicator.
+                # 5b. Periodic device-status scan, staggered.
+                #     Probe ONE device per tick, round-robin across
+                #     proto.assigned_devices. Tick rate is
+                #     scan_interval / N so every device is checked once
+                #     per scan_interval -- but no single tick blocks for
+                #     more than one probe's worth (~1-2s worst case).
                 #
-                #     `scan_state["force"]` flips to True the moment the
-                #     server pushes a device_assignment, so a freshly
-                #     (un)assigned device's status surfaces in seconds
-                #     instead of waiting up to device_scan_interval.
-                due = (
-                    time.ticks_diff(now, scan_state["last"])
-                    >= device_scan_interval * 1000
+                #     Before this stagger, all N devices were probed in
+                #     the same loop iteration, blocking up to
+                #     N * port_count * timeout seconds (24s with 3
+                #     offline devices and the old 4-port * 2s scanner)
+                #     and starving heartbeats + watchdog feeding.
+                devices = proto.assigned_devices
+                n = len(devices) if devices else 0
+                per_device_interval = (
+                    int(device_scan_interval * 1000 / n) if n else None
                 )
-                if proto.assigned_devices and (due or scan_state["force"]):
+                due = (
+                    per_device_interval is not None
+                    and time.ticks_diff(now, scan_state["last"])
+                    >= per_device_interval
+                )
+                if devices and (due or scan_state["force"]):
                     if _scanner is None:
                         from network_scanner import NetworkScanner
-                        _scanner = NetworkScanner(timeout=2)
+                        _scanner = NetworkScanner()
                     try:
-                        scan_results = _scanner.check_devices(proto.assigned_devices)
-                        statuses = []
-                        for r in scan_results:
-                            # Skip rows missing public_id (server can't route them
-                            # without it). Shouldn't happen post-fix but be defensive.
-                            if not r.get("public_id"):
-                                continue
-                            statuses.append({
-                                "public_id": r["public_id"],
-                                "online": r.get("online", False),
-                                "ip": r.get("ip"),
-                            })
-                        if statuses:
-                            ws.send({"type": "device_status", "devices": statuses})
+                        idx = scan_state["cursor"] % n
+                        target = devices[idx]
+                        r = _scanner.check_one(target)
+                        if r.get("public_id"):
+                            ws.send(
+                                {
+                                    "type": "device_status",
+                                    "devices": [
+                                        {
+                                            "public_id": r["public_id"],
+                                            "online": r.get("online", False),
+                                            "ip": r.get("ip"),
+                                        }
+                                    ],
+                                }
+                            )
+                        scan_state["cursor"] = (idx + 1) % n
                     except Exception as scan_exc:
                         print("[main] device scan failed:", scan_exc)
                     scan_state["last"] = now
