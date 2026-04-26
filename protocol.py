@@ -108,6 +108,17 @@ class ProtocolHandler:
         # Message counter (for debugging -- how many messages have we processed?).
         self._message_count = 0
 
+        # Server-assigned identity + monitoring list, populated by the auth_ok
+        # message right after the WebSocket handshake. Other modules (e.g. a
+        # device pinger) can read these once auth completes. They stay on the
+        # ProtocolHandler so reconnect logic can re-fetch them cleanly.
+        self.pico_id = None
+        self.assigned_devices = []
+        # Optional callback fired the moment auth_ok lands. Lets other modules
+        # react (start the device-status loop, light an LED green, etc.)
+        # without coupling them to this class.
+        self._on_auth_ok = None
+
         # Register built-in handlers that don't depend on external modules.
         self._register_builtins()
 
@@ -131,6 +142,18 @@ class ProtocolHandler:
 
         # "get_status" -- server wants our current status.
         self._handlers["get_status"] = self._handle_get_status
+
+        # "auth_ok" -- server confirms the WebSocket handshake succeeded and
+        # tells us our pico_id + which devices we should monitor. Stored so
+        # other modules can read self.pico_id / self.assigned_devices.
+        self._handlers["auth_ok"] = self._handle_auth_ok
+
+        # "pong" -- server's reply to our heartbeat. We don't need to act on
+        # it -- the timestamp already got bumped in dispatch() before we got
+        # here -- but we still need a registered handler so dispatch() doesn't
+        # bounce an "error: unknown type" message back to the server every
+        # 30 seconds.
+        self._handlers["pong"] = self._handle_pong
 
     def register(self, message_type, handler_func):
         """
@@ -326,6 +349,68 @@ class ProtocolHandler:
         Some servers use this for latency measurement.
         """
         proto.send_response("pong")
+
+    def _handle_auth_ok(self, message, proto):
+        """
+        Server confirms successful WebSocket auth and hands us our identity
+        and monitoring list.
+
+        Server sends:
+            {
+              "type": "auth_ok",
+              "pico_id": "qTgwH",            # our public_id on the server
+              "assigned_devices": [...]      # list of {public_id, mac, ip} dicts
+                                             # this Pico is responsible for pinging
+            }
+
+        We:
+          - Stash both on self so other modules (a device pinger, an LED
+            controller, etc.) can read them.
+          - Fire the optional on_auth_ok callback registered by main.py.
+          - Print a friendly log line for serial-console debugging.
+
+        We don't reply -- the server isn't waiting for an ack.
+        """
+        self.pico_id = message.get("pico_id")
+        devices = message.get("assigned_devices") or []
+        self.assigned_devices = devices
+
+        print(
+            "[proto] auth_ok received -- pico_id=",
+            self.pico_id,
+            " devices=",
+            len(devices),
+            sep="",
+        )
+
+        if self._on_auth_ok is not None:
+            try:
+                self._on_auth_ok(self.pico_id, devices)
+            except Exception as exc:
+                # Don't let a buggy callback crash the firmware; just log.
+                print("[proto] on_auth_ok callback raised:", exc)
+
+    def _handle_pong(self, message, proto):
+        """
+        Server's reply to one of our heartbeats. Nothing to do -- the
+        liveness timestamp was already bumped in dispatch() before we got
+        called. Existence of this handler matters only because it stops
+        dispatch() from bouncing back an "error: unknown type" message
+        every 30 seconds.
+        """
+        # No-op. Intentional.
+        pass
+
+    def set_on_auth_ok(self, callback):
+        """
+        Register a callable invoked the moment auth_ok arrives.
+
+        Signature: callback(pico_id: str, assigned_devices: list[dict])
+
+        Use case: main.py can wire up a device-pinger module here so it
+        only starts polling once the server has told us what to monitor.
+        """
+        self._on_auth_ok = callback
 
     def _handle_config_update(self, message, proto):
         """
