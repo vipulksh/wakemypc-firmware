@@ -93,12 +93,20 @@ FIRMWARE_VERSION = "1.0.0"
 # -------------------------------------------------------------------------
 # Boot Sequence
 # -------------------------------------------------------------------------
-def boot():
+def boot(reuse=None):
     """
     The boot sequence: set everything up before entering the main loop.
 
     Returns a dict of all initialized components, or None if boot failed
     critically (no config, no WiFi, etc.).
+
+    Reuse fast-path:
+      If `reuse` is a previous components dict and its WiFi is still
+      connected, we skip Step 3 (WiFi connect, the slowest part of boot:
+      5-15s) and Step 2 (LED re-init). Only the WebSocket-and-up layers
+      get rebuilt. This is what main()'s reconnect path uses when only
+      the WebSocket dropped, which is most reconnects -- the LAN didn't
+      die, just the server connection blipped.
 
     WHY A FUNCTION?
     Keeping boot logic in a function (instead of top-level code) makes it:
@@ -107,9 +115,16 @@ def boot():
     3. Better for memory (local variables are freed after the function returns,
        unless we explicitly return them)
     """
-    print("=" * 50)
-    print("NetMonitor Pico Firmware v" + FIRMWARE_VERSION)
-    print("=" * 50)
+    # Skip the noisy banner on a partial reboot -- the user log already
+    # shows the previous one, and a fresh one looks like a hard reset
+    # (which it isn't).
+    is_partial = bool(reuse and reuse.get("wifi") and reuse["wifi"].is_connected())
+    if not is_partial:
+        print("=" * 50)
+        print("NetMonitor Pico Firmware v" + FIRMWARE_VERSION)
+        print("=" * 50)
+    else:
+        print("[boot] Partial reboot -- WiFi still up, only re-establishing WebSocket")
 
     # Run garbage collection before we start. This frees any memory left over
     # from the REPL or previous code that was loaded.
@@ -147,52 +162,62 @@ def boot():
     # ------------------------------------------------------------------
     # Step 2: Initialize LED Controller
     # ------------------------------------------------------------------
-    # The LED gives visual feedback about what the Pico is doing.
-    # We initialize it early so we can show status during boot.
-    print("\n[boot] Step 2: Initializing LED...")
-    led = LEDController()
-    led.set_pattern("connecting")  # Slow blink = "I'm starting up"
+    # On the reuse path we keep the existing LED instance so its state
+    # (pattern, timers) doesn't reset; otherwise create a fresh one.
+    if is_partial:
+        led = reuse["led"]
+        led.set_pattern("connecting")
+    else:
+        print("\n[boot] Step 2: Initializing LED...")
+        led = LEDController()
+        led.set_pattern("connecting")  # Slow blink = "I'm starting up"
 
     # ------------------------------------------------------------------
-    # Step 3: Connect to WiFi
+    # Step 3: Connect to WiFi (skipped if reused WiFi is still up)
     # ------------------------------------------------------------------
-    # This is usually the slowest part of boot (5-15 seconds).
-    # The LED blinks slowly during this phase.
-    print("\n[boot] Step 3: Connecting to WiFi...")
-    wifi = WiFiManager()
+    # This is usually the slowest part of boot (5-15 seconds). On the
+    # reuse path we skip it entirely -- if the previous main loop saw
+    # only the WebSocket fail, the WiFi association is still valid.
+    if is_partial:
+        wifi = reuse["wifi"]
+        wifi_info = wifi.get_info()
+        print("[boot] Reusing WiFi:", wifi_info.get("ssid"), "@", wifi_info.get("ip"))
+    else:
+        print("\n[boot] Step 3: Connecting to WiFi...")
+        wifi = WiFiManager()
 
-    if not wifi_networks:
-        print("[boot] Skipping WiFi (no networks configured)")
-        led.set_pattern("error")
-        # Return what we have -- main() will handle the missing WiFi.
-        return {
-            "config": config,
-            "led": led,
-            "wifi": wifi,
-            "ws": None,
-            "proto": None,
-        }
+        if not wifi_networks:
+            print("[boot] Skipping WiFi (no networks configured)")
+            led.set_pattern("error")
+            # Return what we have -- main() will handle the missing WiFi.
+            return {
+                "config": config,
+                "led": led,
+                "wifi": wifi,
+                "ws": None,
+                "proto": None,
+            }
 
-    # Try to connect. This tries each SSID in order with timeouts.
-    wifi_connected = wifi.connect(wifi_networks)
+        # Try to connect. This tries each SSID in order with timeouts.
+        wifi_connected = wifi.connect(wifi_networks)
 
-    if not wifi_connected:
-        print("[boot] WiFi connection failed!")
-        led.set_pattern("error")  # Fast blink = error
-        return {
-            "config": config,
-            "led": led,
-            "wifi": wifi,
-            "ws": None,
-            "proto": None,
-        }
+        if not wifi_connected:
+            print("[boot] WiFi connection failed!")
+            led.set_pattern("error")  # Fast blink = error
+            return {
+                "config": config,
+                "led": led,
+                "wifi": wifi,
+                "ws": None,
+                "proto": None,
+            }
 
-    # Print WiFi info for debugging.
-    wifi_info = wifi.get_info()
-    print("[boot] WiFi connected!")
-    print("[boot]   SSID:", wifi_info["ssid"])
-    print("[boot]   IP:  ", wifi_info["ip"])
-    print("[boot]   RSSI:", wifi_info["rssi"], "dBm")
+        # Print WiFi info for debugging.
+        wifi_info = wifi.get_info()
+        print("[boot] WiFi connected!")
+        print("[boot]   SSID:", wifi_info["ssid"])
+        print("[boot]   IP:  ", wifi_info["ip"])
+        print("[boot]   RSSI:", wifi_info["rssi"], "dBm")
 
     # ------------------------------------------------------------------
     # Step 4: Connect to WebSocket Server
@@ -341,6 +366,11 @@ def main():
     boot_ticks = time.ticks_ms()
     reconnect_count = 0
 
+    # `last_components` is the previous successful boot's component dict;
+    # we hand it to boot() on retries so it can skip the WiFi step when
+    # the LAN association is still healthy. None on first boot.
+    last_components = None
+
     # ---- Outer Loop: Retry on Failure ----
     while True:
         try:
@@ -350,8 +380,11 @@ def main():
             if watchdog._started:
                 watchdog.feed()
 
-            # Run the boot sequence.
-            components = boot()
+            # Run the boot sequence. Pass last_components so boot() can
+            # take the fast path (reuse WiFi + LED) when the previous
+            # disconnect was WebSocket-only.
+            components = boot(reuse=last_components)
+            last_components = components
             config = components["config"]
             led = components["led"]
             wifi = components["wifi"]
@@ -488,13 +521,14 @@ def main():
             else:
                 led.set_pattern("error")
 
-            # Clean up.
+            # Clean up. Important: do NOT disconnect WiFi here. WiFi
+            # being still associated lets boot() take its fast path on
+            # the next iteration (skips the 5-15s WiFi handshake). If
+            # WiFi is *actually* the cause of the disconnect, the next
+            # boot()'s WiFi state check will detect that and reconnect
+            # properly.
             try:
                 ws.close()
-            except Exception:
-                pass
-            try:
-                wifi.disconnect()
             except Exception:
                 pass
             if hasattr(proto, "_tcp_relay"):
