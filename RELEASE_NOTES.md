@@ -1,58 +1,41 @@
-## v0.3.2 — OTA actually completes now
+## v0.3.3 — survive warm reboot (post-OTA WiFi recovery)
 
-**The fix.** v0.3.1 made OTA *attempt* to work (redirect handling), but
-the rp2 8s hardware watchdog could fire mid-update during long synchronous
-TLS downloads. Symptom: the Pico would reboot somewhere between
-`log_buffer.py` and `main.py`, leaving the firmware in a half-installed
-state until rollback kicked in. v0.3.2 plumbs `watchdog.feed()` through
-the whole OTA pipeline so the WDT keeps getting fed during DNS, TCP
-connect, TLS handshake, request send, and every single recv() chunk.
+**Critical fix.** After v0.3.2 successfully OTA'd a Pico, the device
+would reboot into v0.3.2 and then fail to reconnect to WiFi -- stuck
+in a loop of `Timeout connecting to <SSID>` followed by an 8s WDT
+reset, until the user power-cycled it manually. v0.3.3 fixes this.
 
-**What changed in OTA:**
-- `http_download`, `fetch_manifest`, and `OTAUpdater` accept an optional
-  `feed_watchdog` callback. `main.py` stashes `watchdog.feed` on
-  `proto._feed_watchdog` after each successful boot, and the OTA
-  handler reads it from there.
-- The callback fires before every potentially-slow socket op:
-  resolving DNS, opening the TCP connection, the TLS handshake, sending
-  the GET, receiving the response headers, and each 1KB body chunk.
-- Socket timeout tightened from 30s -> 15s. A stuck connection now
-  fails faster than the WDT.
-- New phase prints (`resolving DNS`, `connecting TCP`, `TLS handshake`)
-  so the next stall narrows the suspect window before reboot rather
-  than vanishing into one silent recv().
+**Root cause.** The CYW43 WiFi chip on the Pico W lives on a separate
+power domain from the RP2040. `machine.reset()` (used by the OTA
+pipeline to load new code) only resets the RP2040; the CYW43 keeps
+its previous session state. The next boot's `wlan.connect()` finds
+the chip still convinced it owns the old SSID, refuses to scan or
+re-associate cleanly, and times out. Power-cycling fixes it because
+that drops chip power; soft reset doesn't.
 
-**Reset cause logging at boot.** `machine.reset_cause()` is now printed
-on every boot. WDT-induced resets get a banner so they're impossible to
-miss in `wakemypc logs --catch-up`:
+**Fix.** [wifi_manager.connect()](src/wifi_manager.py) now toggles
+`active(False) -> sleep(0.5) -> active(True)` at the start of every
+attempt. That drives the chip's power-management pin and forces a
+clean re-init -- the equivalent of toggling WiFi off/on in an OS
+settings panel. Cheap on cold boot (radio was already off), essential
+on warm boot.
 
-```
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-!! Last reset: WATCHDOG (timeout)
-!! Something blocked the main loop > 8s.
-!! Check the last printed phase before the reset.
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-```
+**Apply path.**
 
-**Smaller flash footprint.** The release workflow now minifies every
-`src/*.py` through `python-minifier` (drops comments, docstrings, and
-whitespace; renames locals; preserves global names so cross-module
-imports keep working). The repo source stays human-readable; the bytes
-that hit flash are the lean version. Expect ~30-50% smaller files.
+If you're already on a working v0.3.1 or v0.3.2, OTA to v0.3.3 should
+work end-to-end now (the WDT-during-OTA fix landed in v0.3.2 already).
 
-**Apply path:**
-
-OTA from v0.3.1 should work end-to-end this time. If you're on v0.3.0
-or older, USB-flash first -- v0.3.0 had a broken downloader and can't
-fetch its own update.
-
-```
-docker compose -f docker-compose.local.yml exec django \
-  python manage.py import_firmware_manifest 0.3.2 --mark-latest
-```
-
-Or USB:
+If your Pico is currently *stuck* in the post-v0.3.2 reboot loop, OTA
+won't recover it -- the WS connection never establishes. USB-flash to
+escape:
 
 ```
 wakemypc upload --firmware-dir ./pico_firmware/src/
+```
+
+After USB recovery, future updates flow over OTA normally.
+
+```
+docker compose -f docker-compose.local.yml exec django \
+  python manage.py import_firmware_manifest 0.3.3 --mark-latest
 ```

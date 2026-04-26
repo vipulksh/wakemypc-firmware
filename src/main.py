@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.3.2"
+FIRMWARE_VERSION = "0.3.3"
 
 
 # -------------------------------------------------------------------------

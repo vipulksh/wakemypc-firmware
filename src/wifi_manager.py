@@ -132,9 +132,28 @@ class WiFiManager:
             print("[wifi] No WiFi networks configured!")
             return False
 
-        # Step 1: Activate the WiFi radio.
-        # The radio is OFF by default to save power. We need to turn it on.
-        # This is like flipping the WiFi switch on a laptop.
+        # Step 1: Force-reset the CYW43 WiFi chip before bringing it up.
+        #
+        # WHY THIS DANCE (active(False) -> sleep -> active(True))?
+        # The CYW43 on the Pico W is a separate chip with its own state
+        # machine. It is NOT reset by machine.reset() -- that only resets
+        # the RP2040. After a soft reboot (e.g., the OTA pipeline calls
+        # machine.reset() to load new code), the chip can be left in a
+        # half-associated state from the previous session: it thinks it
+        # still owns the SSID, refuses to scan/connect, and our connect()
+        # silently times out. Power-cycling the Pico fixes it because
+        # that drops chip power; a soft reset doesn't.
+        #
+        # Cycling active(False) -> active(True) drives the chip's
+        # power-management pin and forces a clean re-init -- the
+        # equivalent of toggling WiFi off/on in an OS settings panel.
+        # Cheap on cold boot (active was already False), essential on
+        # warm boot.
+        try:
+            self._wlan.active(False)
+        except Exception:
+            pass
+        time.sleep(0.5)
         self._wlan.active(True)
 
         # Small delay to let the radio initialize. The CYW43 chip needs a
