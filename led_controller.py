@@ -118,6 +118,15 @@ PATTERNS = {
         "sequence": [(50, 50)],  # Very fast strobe
         "repeat": 100,  # ~10 seconds of strobing (100 * 100ms = 10s)
     },
+    # Auth-fail mode. Distinctive double-blink with a long pause so it's
+    # visually different from a generic "error" fast blink. This means the
+    # device_token is wrong / rate-limited; the user needs to reprovision
+    # via `pico-cli register --rotate` or `--token`. Documented in the
+    # firmware README's troubleshooting section.
+    "auth_failed": {
+        "sequence": [(150, 150), (150, 1500)],  # blink, blink, long pause
+        "repeat": -1,
+    },
     # Off / idle. LED stays off.
     "off": {
         "sequence": [(0, 1)],  # 0ms on, 1ms off = always off

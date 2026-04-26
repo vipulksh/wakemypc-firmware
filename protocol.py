@@ -114,6 +114,16 @@ class ProtocolHandler:
         # ProtocolHandler so reconnect logic can re-fetch them cleanly.
         self.pico_id = None
         self.assigned_devices = []
+
+        # Set when the server sends auth_fail (token rejected, rate limited,
+        # etc.). The main loop checks this and switches to a long-cooldown
+        # reconnect schedule -- otherwise the firmware spins reconnecting
+        # with the same bad token at exponential backoff and gets rate-
+        # limited (4029) within seconds, which is wasteful for the server
+        # and useless for the Pico. The auth_fail_reason is human-readable
+        # for serial-console debugging.
+        self.auth_failed = False
+        self.auth_fail_reason = None
         # Optional callback fired the moment auth_ok lands. Lets other modules
         # react (start the device-status loop, light an LED green, etc.)
         # without coupling them to this class.
@@ -182,6 +192,15 @@ class ProtocolHandler:
         # request to us and our reply back to the dashboard.
         self._handlers["wifi_config_get"] = self._handle_wifi_config_get
         self._handlers["wifi_config_set"] = self._handle_wifi_config_set
+
+        # "auth_fail" -- server rejected our token (or rate-limited us).
+        # Without a handler, dispatch() would log "Unknown message type"
+        # and bounce an error back at a server that's about to close the
+        # socket; the firmware would then immediately reconnect with the
+        # same bad token, hit the rate limit, and burn the connection in
+        # a tight loop. Handling auth_fail explicitly lets us flip a flag
+        # main.py respects to back off properly.
+        self._handlers["auth_fail"] = self._handle_auth_fail
 
     def register(self, message_type, handler_func):
         """
@@ -403,6 +422,13 @@ class ProtocolHandler:
         devices = message.get("assigned_devices") or []
         self.assigned_devices = devices
 
+        # Clear any previous auth-failure state -- if the user rotated the
+        # token while we were in the auth-failed cooldown, this confirms
+        # the new token works and main.py can return to its normal
+        # reconnect cadence.
+        self.auth_failed = False
+        self.auth_fail_reason = None
+
         print(
             "[proto] auth_ok received -- pico_id=",
             self.pico_id,
@@ -428,6 +454,37 @@ class ProtocolHandler:
         """
         # No-op. Intentional.
         pass
+
+    def _handle_auth_fail(self, message, proto):
+        """
+        Server rejected our auth (bad token, rate-limited, etc.) and is
+        about to close the socket.
+
+        We:
+          - Log the reason to the serial console for human debugging.
+          - Set self.auth_failed = True. main.py checks this flag in the
+            outer reconnect loop and switches to a long cooldown (5 min
+            instead of exponential 1->60s) so we don't hammer the server
+            with the same bad token. The flag also drives a distinctive
+            LED pattern ("auth_failed") so a user can tell at a glance
+            whether the Pico is offline because of WiFi vs. token issues.
+          - Do NOT send any reply -- the server is closing this socket
+            anyway, and a stray response could land mid-close.
+
+        The flag clears on the next successful auth_ok, so once the user
+        rotates the token (via the dashboard or pico-cli register
+        --rotate / --token <T>) and the Pico's next slow retry succeeds,
+        normal operation resumes automatically -- no power cycle needed.
+        """
+        reason = message.get("reason", "unknown")
+        self.auth_failed = True
+        self.auth_fail_reason = reason
+        print(
+            "[proto] auth_fail received -- reason:",
+            reason,
+            "  Reprovision via 'pico-cli register --rotate' or",
+            "'pico-cli register --token <T>' to recover.",
+        )
 
     def set_on_auth_ok(self, callback):
         """

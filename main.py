@@ -325,6 +325,13 @@ def main():
     # Reconnection backoff tracking.
     reconnect_delay = 1
     max_reconnect_delay = 60
+    # Cooldown when the server has rejected our token (auth_fail). Way
+    # longer than max_reconnect_delay because (a) the token is provably
+    # bad and won't work until the user reprovisions, (b) the server
+    # rate-limits at 5 attempts/minute so anything faster gets us 4029'd.
+    # 5 minutes is short enough that a USB reprovision is picked up
+    # quickly without the user having to manually power-cycle.
+    auth_failed_cooldown = 300
 
     # Track uptime and reconnections for health reporting.
     # boot_ticks records the time.ticks_ms() value at startup so we can
@@ -460,10 +467,26 @@ def main():
                     print("[main] WebSocket disconnected!")
                     break  # Exit inner loop to reconnect.
 
+                # 9. Check if the server rejected our token. If so, exit
+                # the inner loop -- main.py's outer loop will pick up the
+                # auth_failed flag and switch to the long cooldown.
+                if proto.auth_failed:
+                    print(
+                        "[main] auth_fail flagged by protocol handler --",
+                        "token rejected. Reason:", proto.auth_fail_reason,
+                    )
+                    break
+
             # If we exit the inner loop, something disconnected.
             reconnect_count += 1
             print("[main] Connection lost, will reconnect... (reconnect #" + str(reconnect_count) + ")")
-            led.set_pattern("error")
+            # Distinct LED pattern when the disconnect is auth-related so
+            # a user looking at the device can tell "wrong token" from
+            # "WiFi died" without plugging in a serial cable.
+            if proto and proto.auth_failed:
+                led.set_pattern("auth_failed")
+            else:
+                led.set_pattern("error")
 
             # Clean up.
             try:
@@ -489,13 +512,24 @@ def main():
             # Log it and continue to the retry loop.
             print("[main] Unexpected error:", e)
 
-        # Wait before reconnecting (with exponential backoff).
-        # Feed the watchdog during the wait so it doesn't reboot us.
-        print("[main] Reconnecting in", reconnect_delay, "seconds...")
-        wait_with_watchdog(watchdog, led, reconnect_delay)
-
-        # Increase backoff for next failure.
-        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+        # Wait before reconnecting. Auth failures get a fixed long cooldown
+        # (token won't work until reprovisioned, server rate-limits at 5
+        # attempts/minute); other failures get the usual exponential
+        # backoff capped at max_reconnect_delay.
+        if proto and proto.auth_failed:
+            print(
+                "[main] Auth failed -- cooldown for",
+                auth_failed_cooldown,
+                "seconds. Reprovision via 'pico-cli register --rotate' or --token to recover.",
+            )
+            wait_with_watchdog(watchdog, led, auth_failed_cooldown)
+            # Don't escalate the regular backoff while in auth-failed
+            # mode; the cooldown is already long.
+        else:
+            print("[main] Reconnecting in", reconnect_delay, "seconds...")
+            wait_with_watchdog(watchdog, led, reconnect_delay)
+            # Increase backoff for next failure.
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
 
 
 def wait_with_watchdog(watchdog, led, seconds):
