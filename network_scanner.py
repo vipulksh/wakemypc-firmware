@@ -276,9 +276,14 @@ class NetworkScanner:
             # Check the device.
             result = self.check_device(ip, ports=quick_ports)
 
-            # Add metadata from the input.
+            # Forward all input metadata to the result. We previously only
+            # copied "name" and "mac"; that dropped public_id, which the
+            # server-side _handle_device_status keys off. Without public_id
+            # the server doesn't know which Device row to update and the
+            # dashboard's online/offline dot stays stuck.
             result["name"] = target.get("name", "")
             result["mac"] = target.get("mac", "")
+            result["public_id"] = target.get("public_id", "")
 
             results.append(result)
 

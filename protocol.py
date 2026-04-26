@@ -202,6 +202,14 @@ class ProtocolHandler:
         # main.py respects to back off properly.
         self._handlers["auth_fail"] = self._handle_auth_fail
 
+        # "device_assignment" -- server pushes the updated managed-device
+        # list when the user (re)assigns devices in the dashboard. We
+        # replace self.assigned_devices so the periodic device scanner
+        # (in main.py) starts pinging the new IPs immediately. Without
+        # this handler, dashboard reassignments updated only the server
+        # DB; the Pico kept pinging the old set forever.
+        self._handlers["device_assignment"] = self._handle_device_assignment
+
     def register(self, message_type, handler_func):
         """
         Register a handler function for a message type.
@@ -454,6 +462,26 @@ class ProtocolHandler:
         """
         # No-op. Intentional.
         pass
+
+    def _handle_device_assignment(self, message, proto):
+        """
+        Server pushed an updated list of devices this Pico should
+        monitor. Replace our in-memory list. main.py's periodic
+        scanner reads self.assigned_devices each tick, so the new
+        list takes effect on the very next scan cycle.
+
+        Server payload (from api/views.py _notify_pico_device_change):
+            {"type": "device_assignment",
+             "devices": [{"public_id": "...", "name": "...",
+                          "mac": "...", "ip": "..."}, ...]}
+
+        We don't ack -- the server doesn't expect one. Reassignment is
+        fire-and-forget; the next device_status emission will reflect
+        the new list naturally.
+        """
+        devices = message.get("devices") or []
+        self.assigned_devices = devices
+        print("[proto] device_assignment: now monitoring", len(devices), "devices")
 
     def _handle_auth_fail(self, message, proto):
         """

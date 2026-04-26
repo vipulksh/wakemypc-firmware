@@ -416,6 +416,17 @@ def main():
             # Track heartbeat timing.
             heartbeat_interval = config.get("heartbeat_interval", 30)
             last_heartbeat = time.ticks_ms()
+            # Periodic device-status scan timing. The Pico walks
+            # proto.assigned_devices, TCP-probes each, and sends a
+            # `device_status` message so the dashboard's online/offline
+            # dot reflects reality. Default 60s -- low enough to feel
+            # responsive, high enough to not melt a Pico that's
+            # monitoring 10+ devices.
+            device_scan_interval = config.get("device_scan_interval", 60)
+            last_device_scan = time.ticks_ms()
+            # Lazy-import the scanner so boot stays light if no devices
+            # are assigned yet (it's never imported in that case).
+            _scanner = None
 
             # ---- Inner Loop: Process Messages ----
             while True:
@@ -484,6 +495,38 @@ def main():
 
                     proto.send_heartbeat(wifi_info, health)
                     last_heartbeat = now
+
+                # 5b. Periodic device-status scan.
+                #     Walk the assigned-devices list, TCP-probe each,
+                #     emit one `device_status` message with all results.
+                #     The server's _handle_device_status keys off public_id
+                #     to update the per-device online/offline cache that
+                #     drives the dashboard's status indicator.
+                if (
+                    proto.assigned_devices
+                    and time.ticks_diff(now, last_device_scan) >= device_scan_interval * 1000
+                ):
+                    if _scanner is None:
+                        from network_scanner import NetworkScanner
+                        _scanner = NetworkScanner(timeout=2)
+                    try:
+                        scan_results = _scanner.check_devices(proto.assigned_devices)
+                        statuses = []
+                        for r in scan_results:
+                            # Skip rows missing public_id (server can't route them
+                            # without it). Shouldn't happen post-fix but be defensive.
+                            if not r.get("public_id"):
+                                continue
+                            statuses.append({
+                                "public_id": r["public_id"],
+                                "online": r.get("online", False),
+                                "ip": r.get("ip"),
+                            })
+                        if statuses:
+                            ws.send({"type": "device_status", "devices": statuses})
+                    except Exception as scan_exc:
+                        print("[main] device scan failed:", scan_exc)
+                    last_device_scan = now
 
                 # 6. Check WebSocket health (ping/pong).
                 if not ws.check_heartbeat():

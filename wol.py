@@ -243,25 +243,33 @@ def handle_wol(message, proto):
     Protocol handler for WOL commands from the server.
 
     Expected message format:
-        {"type": "wol", "mac": "AA:BB:CC:DD:EE:FF"}
+        {"type": "wol", "request_id": "abc123", "mac": "AA:BB:CC:DD:EE:FF"}
 
     Optional fields:
         "broadcast": "192.168.1.255"  (custom broadcast address)
         "count": 3                     (send the packet multiple times for reliability)
 
     Response:
-        {"type": "wol_result", "success": true/false, "mac": "...", "message": "..."}
+        {"type": "wol_result", "request_id": "abc123",
+         "success": true/false, "mac": "...", "message": "..."}
+
+    The request_id is echoed back unchanged so the server's
+    cmd.result -> dashboard toast can match the response to the
+    original wake button click. Without it, the dashboard sees a
+    response with no correlation key and can't update the right toast.
 
     WHY SEND MULTIPLE TIMES?
     WOL uses UDP, which is unreliable -- packets can be lost. Sending the
     magic packet 2-3 times increases the chance of success. We add a small
     delay between sends to avoid congestion.
     """
+    request_id = message.get("request_id")  # echo back unchanged
     mac = message.get("mac")
     if not mac:
         proto.send_response(
             "wol_result",
             {
+                "request_id": request_id,
                 "success": False,
                 "message": "No MAC address provided",
             },
@@ -292,4 +300,5 @@ def handle_wol(message, proto):
 
     if result:
         result["packets_sent"] = count
+        result["request_id"] = request_id
         proto.send_response("wol_result", result)
