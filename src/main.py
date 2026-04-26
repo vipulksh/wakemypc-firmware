@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "1.0.0"
+FIRMWARE_VERSION = "0.1.0"
 
 
 # -------------------------------------------------------------------------
@@ -121,7 +121,7 @@ def boot(reuse=None):
     is_partial = bool(reuse and reuse.get("wifi") and reuse["wifi"].is_connected())
     if not is_partial:
         print("=" * 50)
-        print("NetMonitor Pico Firmware v" + FIRMWARE_VERSION)
+        print("WakeMyPC Pico Firmware v" + FIRMWARE_VERSION)
         print("=" * 50)
     else:
         print("[boot] Partial reboot -- WiFi still up, only re-establishing WebSocket")

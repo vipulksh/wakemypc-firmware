@@ -1,0 +1,91 @@
+# Build a MANIFEST.json from src/ and cut a GitHub Release on tag push.
+#
+# When you push a tag like `v0.2.1`, this workflow:
+#  1. Reads release_config.json for min_compat_version + tier_required.
+#  2. Hashes every src/*.py with sha256.
+#  3. Writes MANIFEST.json with paths, URLs, hashes, and the config values.
+#  4. Creates a GitHub Release using RELEASE_NOTES.md as the body.
+#  5. Attaches MANIFEST.json and all src/*.py as release assets.
+#
+# To change min_compat_version or tier_required for a release:
+#   edit release_config.json, commit, then push the tag.
+#
+# To write a release body:
+#   edit RELEASE_NOTES.md, commit, then push the tag.
+#   The file is overwritten each release -- it always reflects the latest.
+
+name: Release firmware
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build MANIFEST.json
+        id: manifest
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          repo="${GITHUB_REPOSITORY}"
+          base_url="https://github.com/${repo}/releases/download/${tag}"
+
+          if [ -f MANIFEST.json ]; then
+            # Manual MANIFEST.json committed to the repo -- use it as-is.
+            # Useful when you need post-install hooks, a custom file list,
+            # or a breaking-change migration that the auto-generator can't
+            # express. The file is attached to the release unchanged.
+            echo "Using committed MANIFEST.json (manual override)"
+          else
+            # Auto-generate from src/*.py.
+            # Read release metadata from release_config.json.
+            # min_compat_version: bump when a release requires a migration
+            #   or ABI change that older firmware can't safely skip.
+            # tier_required: set to "supporter" to gate a beta to paying users.
+            min_compat=$(jq -r '.min_compat_version // "0.0.0"' release_config.json 2>/dev/null || echo "0.0.0")
+            tier=$(jq -r '.tier_required // "free"' release_config.json 2>/dev/null || echo "free")
+
+            files=$(
+              cd src
+              for f in *.py; do
+                [ -f "$f" ] || continue
+                hash=$(sha256sum "$f" | cut -d' ' -f1)
+                printf '{"path":"%s","url":"%s/%s","sha256":"%s"}\n' \
+                  "$f" "$base_url" "$f" "$hash"
+              done | jq -s .
+            )
+
+            jq -n \
+              --arg version "$version" \
+              --arg min_compat "$min_compat" \
+              --arg tier "$tier" \
+              --argjson files "$files" \
+              '{
+                 version: $version,
+                 min_compat_version: $min_compat,
+                 tier_required: $tier,
+                 files: $files
+               }' > MANIFEST.json
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.manifest.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            MANIFEST.json
+            src/*.py

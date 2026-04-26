@@ -63,7 +63,7 @@ gc.collect()
 # This ID is burned into the chip at the factory and cannot be changed.
 # We use it as the device's identity when registering with the server.
 print("=" * 40)
-print("Pico W 2 - NetMonitor IoT Agent")
+print("Pico W 2 - WakeMyPC IoT Agent")
 print(f"Unique ID: {machine.unique_id().hex()}")
 print(f"CPU Freq:  {machine.freq() // 1_000_000} MHz")
 print(f"Free RAM:  {gc.mem_free()} bytes")

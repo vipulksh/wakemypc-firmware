@@ -1,0 +1,25 @@
+{
+  "_comment": "Template for the MANIFEST.json that ships with each GitHub Release. The release workflow generates the real one from src/. Each `files` entry is an .py module on the Pico's flash; sha256 lets the Pico verify downloads. `post_install` runs the file once after staging-swap (use for secrets.json migrations); `delete_after` removes the script after it runs.",
+  "version": "1.0.1",
+  "min_compat_version": "1.0.0",
+  "tier_required": "free",
+  "files": [
+    {
+      "path": "boot.py",
+      "url": "https://github.com/<owner>/wakemypc-firmware/releases/download/v1.0.1/boot.py",
+      "sha256": "<filled in by release.yml>"
+    },
+    {
+      "path": "main.py",
+      "url": "https://github.com/<owner>/wakemypc-firmware/releases/download/v1.0.1/main.py",
+      "sha256": "<filled in by release.yml>"
+    },
+    {
+      "path": "_migrate_1_0_1.py",
+      "url": "https://github.com/<owner>/wakemypc-firmware/releases/download/v1.0.1/_migrate_1_0_1.py",
+      "sha256": "<filled in by release.yml>",
+      "post_install": true,
+      "delete_after": true
+    }
+  ]
+}
