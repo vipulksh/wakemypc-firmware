@@ -163,127 +163,161 @@ def file_sha256(filepath):
         return None
 
 
-def http_download(url, dest_path, max_size=MAX_FILE_SIZE):
+def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
     """
-    Download a file from an HTTP(S) URL and save it to the filesystem.
-
-    This is a minimal HTTP client -- we don't use the `requests` library
-    because it might not be available in all MicroPython builds.
+    Download a file from an HTTP(S) URL and save it to the filesystem,
+    following redirects.
 
     Parameters:
-        url:       The URL to download from (http:// or https://)
-        dest_path: Where to save the file on the Pico's flash
-        max_size:  Maximum allowed file size in bytes
+        url:           starting URL (http:// or https://)
+        dest_path:     where to save the file on the Pico's flash
+        max_size:      maximum allowed file size in bytes
+        max_redirects: how many 3xx redirects to follow before giving up
 
     Returns (success: bool, error_message: str or None)
 
-    HOW HTTP DOWNLOAD WORKS:
-    1. Parse the URL to get host, port, and path.
-    2. Open a TCP connection to the server.
-    3. Optionally wrap in TLS for HTTPS.
-    4. Send an HTTP GET request.
-    5. Read the response headers to get the content length.
-    6. Read the response body and write it to a file.
+    Why the explicit redirect loop matters: GitHub release asset URLs
+    (https://github.com/<owner>/<repo>/releases/download/<tag>/<file>)
+    ALWAYS reply 302 Found with a Location: pointing at a CDN host
+    (objects.githubusercontent.com or similar). The previous version
+    of this function treated any non-200 status as a hard error, so
+    OTA against GitHub releases silently failed on the very first
+    byte of every attempt. Now we follow up to max_redirects hops.
     """
-    try:
-        # Parse URL.
-        use_ssl = url.startswith("https://")
-        url_stripped = url.replace("https://", "").replace("http://", "")
+    current_url = url
+    for hop in range(max_redirects + 1):
+        print("[ota.http] hop=", hop, "GET", current_url)
+        try:
+            use_ssl = current_url.startswith("https://")
+            url_stripped = current_url.replace("https://", "").replace("http://", "")
 
-        if "/" in url_stripped:
-            host_port, path = url_stripped.split("/", 1)
-            path = "/" + path
-        else:
-            host_port = url_stripped
-            path = "/"
+            if "/" in url_stripped:
+                host_port, path = url_stripped.split("/", 1)
+                path = "/" + path
+            else:
+                host_port = url_stripped
+                path = "/"
 
-        if ":" in host_port:
-            host, port = host_port.split(":", 1)
-            port = int(port)
-        else:
-            host = host_port
-            port = 443 if use_ssl else 80
+            if ":" in host_port:
+                host, port = host_port.split(":", 1)
+                port = int(port)
+            else:
+                host = host_port
+                port = 443 if use_ssl else 80
 
-        # Connect.
-        addr = socket.getaddrinfo(host, port)[0][-1]
-        sock = socket.socket()
-        sock.settimeout(30)
-        sock.connect(addr)
+            print("[ota.http]   host=", host, "port=", port, "ssl=", use_ssl)
+            addr = socket.getaddrinfo(host, port)[0][-1]
+            sock = socket.socket()
+            sock.settimeout(30)
+            sock.connect(addr)
 
-        if use_ssl:
-            sock = ssl.wrap_socket(sock, server_hostname=host)
+            if use_ssl:
+                sock = ssl.wrap_socket(sock, server_hostname=host)
 
-        # Send HTTP GET request.
-        request = (
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        ).format(path=path, host=host)
-        sock.send(request.encode())
+            request = (
+                "GET {path} HTTP/1.0\r\nHost: {host}\r\n"
+                "User-Agent: wakemypc-pico-ota/1\r\n"
+                "Connection: close\r\n\r\n"
+            ).format(path=path, host=host)
+            sock.send(request.encode())
 
-        # Read response headers.
-        # HTTP/1.0 responses end headers with \r\n\r\n.
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = sock.recv(1024)
-            if not chunk:
-                sock.close()
-                return False, "Connection closed during headers"
-            response += chunk
-
-        # Split headers from body.
-        header_end = response.index(b"\r\n\r\n")
-        headers = response[:header_end].decode("ascii", "replace")
-        body_start = response[header_end + 4 :]
-
-        # Check status code.
-        status_line = headers.split("\r\n")[0]
-        if "200" not in status_line:
-            sock.close()
-            return False, "HTTP error: " + status_line
-
-        # Check content length if available.
-        content_length = -1
-        for line in headers.split("\r\n"):
-            if line.lower().startswith("content-length:"):
-                content_length = int(line.split(":")[1].strip())
-                break
-
-        if content_length > max_size:
-            sock.close()
-            return False, "File too large: {} bytes (max: {})".format(
-                content_length, max_size
-            )
-
-        # Write body to file.
-        total_bytes = 0
-        with open(dest_path, "wb") as f:
-            # Write any body data we already received with the headers.
-            if body_start:
-                f.write(body_start)
-                total_bytes += len(body_start)
-
-            # Read remaining body.
-            while True:
+            response = b""
+            while b"\r\n\r\n" not in response:
                 chunk = sock.recv(1024)
                 if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > max_size:
                     sock.close()
-                    f.close()
-                    # Clean up the partial file.
-                    try:
-                        os.remove(dest_path)
-                    except OSError:
-                        pass
-                    return False, "File exceeded max size during download"
-                f.write(chunk)
+                    return False, "Connection closed during headers"
+                response += chunk
 
-        sock.close()
-        print("[ota] Downloaded", total_bytes, "bytes to", dest_path)
-        return True, None
+            header_end = response.index(b"\r\n\r\n")
+            headers = response[:header_end].decode("ascii", "replace")
+            body_start = response[header_end + 4 :]
 
-    except Exception as e:
-        return False, str(e)
+            status_line = headers.split("\r\n")[0]
+            print("[ota.http]   status=", status_line)
+
+            # Parse status code out of the line ("HTTP/1.1 302 Found").
+            try:
+                status_code = int(status_line.split(" ")[1])
+            except (IndexError, ValueError):
+                sock.close()
+                return False, "Malformed status line: " + status_line
+
+            # Follow redirects (301 permanent, 302/303 found, 307/308 PRD).
+            if status_code in (301, 302, 303, 307, 308):
+                location = None
+                for line in headers.split("\r\n"):
+                    if line.lower().startswith("location:"):
+                        location = line.split(":", 1)[1].strip()
+                        break
+                sock.close()
+                if not location:
+                    return False, "{} redirect with no Location header".format(
+                        status_code
+                    )
+                # Resolve relative redirects against the current host
+                # (preserves the scheme of the current request).
+                if location.startswith("/"):
+                    scheme = "https://" if use_ssl else "http://"
+                    location = scheme + host + location
+                # Refuse HTTPS -> HTTP downgrades. A MITM could craft a
+                # redirect to plaintext and harvest the body. Firmware
+                # downloads must stay on TLS once started on TLS.
+                if use_ssl and location.startswith("http://"):
+                    return False, "Refusing HTTPS->HTTP downgrade redirect to " + location
+                if not (location.startswith("https://") or location.startswith("http://")):
+                    return False, "Refusing redirect to non-http(s) scheme: " + location
+                print("[ota.http]   -> redirect to", location)
+                current_url = location
+                continue  # next hop
+
+            if status_code != 200:
+                sock.close()
+                return False, "HTTP error: " + status_line
+
+            content_length = -1
+            for line in headers.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":")[1].strip())
+                    break
+            print("[ota.http]   content_length=", content_length)
+
+            if content_length > max_size:
+                sock.close()
+                return False, "File too large: {} bytes (max: {})".format(
+                    content_length, max_size
+                )
+
+            total_bytes = 0
+            with open(dest_path, "wb") as f:
+                if body_start:
+                    f.write(body_start)
+                    total_bytes += len(body_start)
+
+                while True:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > max_size:
+                        sock.close()
+                        f.close()
+                        try:
+                            os.remove(dest_path)
+                        except OSError:
+                            pass
+                        return False, "File exceeded max size during download"
+                    f.write(chunk)
+
+            sock.close()
+            print("[ota.http]   downloaded", total_bytes, "bytes to", dest_path)
+            return True, None
+
+        except Exception as e:
+            print("[ota.http]   error:", e)
+            return False, str(e)
+
+    return False, "Too many redirects (max {})".format(max_redirects)
 
 
 # -------------------------------------------------------------------------
@@ -484,22 +518,34 @@ def fetch_manifest(manifest_url):
 
     The GitHub Actions release workflow (release.yml) builds this file
     automatically when a version tag is pushed. It is the single source
-    of truth for what files ship in each release -- the server reads it,
-    and now the Pico reads it directly so both sides agree without the
-    server having to embed the full file list in every OTA message.
+    of truth for what files ship in each release.
     """
+    print("[ota] fetch_manifest:", manifest_url)
     success, error = http_download(manifest_url, "/tmp_manifest.json")
     if not success:
         raise Exception("Failed to download manifest: " + str(error))
 
     try:
         with open("/tmp_manifest.json") as f:
-            raw = json.loads(f.read())
+            raw_text = f.read()
+        print("[ota]   manifest size:", len(raw_text), "bytes")
+        raw = json.loads(raw_text)
     finally:
         try:
             os.remove("/tmp_manifest.json")
         except OSError:
             pass
+
+    print(
+        "[ota]   manifest version=",
+        raw.get("version"),
+        "min_compat=",
+        raw.get("min_compat_version"),
+        "tier=",
+        raw.get("tier_required"),
+        "files=",
+        len(raw.get("files", [])),
+    )
 
     files = []
     for entry in raw.get("files", []):
@@ -508,6 +554,8 @@ def fetch_manifest(manifest_url):
         checksum = entry.get("sha256", "")
         if filename and url and checksum:
             files.append({"filename": filename, "url": url, "checksum": checksum})
+        else:
+            print("[ota]   skipping incomplete entry:", entry)
 
     return files
 
@@ -540,27 +588,51 @@ def handle_ota_update(message, proto):
     """
     manifest_url = message.get("manifest_url")
     files = message.get("files", [])
+    version = message.get("version", "?")
+
+    print("[ota] handle_ota_update: version=", version,
+          "manifest_url=", "yes" if manifest_url else "no",
+          "inline_files=", len(files))
 
     if manifest_url:
-        print("[ota] Fetching manifest from", manifest_url)
         try:
             files = fetch_manifest(manifest_url)
         except Exception as e:
+            print("[ota] manifest fetch failed:", e)
             proto.send_response(
                 "ota_result",
-                {"success": False, "message": "Manifest fetch failed: " + str(e)},
+                {
+                    "success": False,
+                    "version": version,
+                    "message": "Manifest fetch failed: " + str(e),
+                },
             )
             return
 
     if not files:
+        print("[ota] no files to update")
         proto.send_response(
             "ota_result",
-            {"success": False, "message": "No files in manifest"},
+            {
+                "success": False,
+                "version": version,
+                "message": "No files in manifest",
+            },
         )
         return
 
+    print("[ota] beginning update of", len(files), "file(s) for v" + str(version))
     updater = OTAUpdater()
     result = updater.update(files)
+    result["version"] = version
+    print(
+        "[ota] update complete: success=",
+        result.get("success"),
+        "updated=",
+        result.get("updated"),
+        "message=",
+        result.get("message"),
+    )
 
     proto.send_response("ota_result", result)
 

@@ -95,6 +95,22 @@ CONFIG_FILE = "secrets.json"
 CONFIG_BACKUP = "secrets.json.bak"
 
 
+def _mask(s):
+    """Return a debug-safe rendering of a secret string.
+
+    Shows the first 4 characters + the length and a masked tail, so an
+    operator can confirm the right token / password is loaded ('does it
+    start with 4f3a...?') without enough material to reconstruct it
+    from a shared log. Empty values render as '(empty)'.
+    """
+    if not s:
+        return "(empty)"
+    if len(s) <= 4:
+        # Too short to safely show any prefix -- just give the length.
+        return "*** ({}c)".format(len(s))
+    return "{}*** ({}c)".format(s[:4], len(s))
+
+
 # -------------------------------------------------------------------------
 # Config Class
 # -------------------------------------------------------------------------
@@ -145,19 +161,36 @@ class Config:
                 # in a firmware update, the default value is used.
                 if isinstance(loaded, dict):
                     self._data.update(loaded)
-                    # Print config summary with secrets masked so the log
-                    # shows what's configured without leaking credentials.
-                    # Masked fields: device_token, wifi passwords.
-                    wifi_ssids = [
-                        n.get("ssid", "?")
-                        for n in self._data.get("wifi_networks", [])
-                    ]
+                    # Print config summary with secrets partially masked.
+                    # Showing the first few chars + length is enough for an
+                    # operator to confirm the right value is loaded without
+                    # leaking the full secret if logs are shared.
                     print("[config] Loaded from", filename)
-                    print("[config]   device_id  =", self._data.get("device_id", "(none)"))
-                    print("[config]   server_url =", self._data.get("server_url", "(none)"))
-                    print("[config]   ws_endpoint=", self._data.get("ws_endpoint", "(none)"))
-                    print("[config]   wifi_ssids =", wifi_ssids)
-                    print("[config]   token      = ***masked***")
+                    print(
+                        "[config]   device_id  =",
+                        self._data.get("device_id", "(none)"),
+                    )
+                    print(
+                        "[config]   server_url =",
+                        self._data.get("server_url", "(none)"),
+                    )
+                    print(
+                        "[config]   ws_endpoint=",
+                        self._data.get("ws_endpoint", "(none)"),
+                    )
+                    for net in self._data.get("wifi_networks", []) or []:
+                        print(
+                            "[config]   wifi       = ssid=",
+                            net.get("ssid", "?"),
+                            "| password=",
+                            _mask(net.get("password", "")),
+                            "| order=",
+                            net.get("order", 0),
+                        )
+                    print(
+                        "[config]   token      =",
+                        _mask(self._data.get("device_token", "")),
+                    )
                     return True
 
             except OSError:

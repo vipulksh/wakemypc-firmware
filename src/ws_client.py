@@ -238,7 +238,22 @@ class WebSocketClient:
         After this, the connection is "upgraded" from HTTP to WebSocket,
         and both sides can send frames freely.
         """
-        print("[ws] Connecting to", self._url)
+        print(
+            "[ws] Connecting to",
+            self._url,
+            "| host=",
+            self._host,
+            "| port=",
+            self._port,
+            "| tls=",
+            self._use_ssl,
+        )
+        if not self._use_ssl:
+            # ws:// is fine for local dev / a LAN-only deployment, but
+            # in production wakemypc.com always serves wss://, so a
+            # plaintext connection there is almost certainly a mis-
+            # provisioning. Surface it loudly.
+            print("[ws] WARNING: connecting over plaintext ws:// (no TLS)")
 
         try:
             # Step 1: DNS resolution and TCP connection.

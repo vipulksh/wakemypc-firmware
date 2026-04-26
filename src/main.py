@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.3.0"
+FIRMWARE_VERSION = "0.3.1"
 
 
 # -------------------------------------------------------------------------
@@ -457,19 +457,55 @@ def main():
             # are assigned yet (it's never imported in that case).
             _scanner = None
 
+            # ---- Inner Loop diagnostics ----
+            # iter_count + last_tick_log let us emit a periodic "still
+            # alive, this is what we're doing" line every 5 seconds.
+            # Without this, when the loop wedges on something blocking
+            # the log goes silent and we can't tell *which* phase wedged.
+            # The phase variable is updated before each potentially
+            # blocking call; if the firmware crashes or the watchdog
+            # fires, the last printed phase tells us where it died.
+            iter_count = 0
+            last_tick_log = time.ticks_ms()
+            phase = "init"
+
             # ---- Inner Loop: Process Messages ----
             while True:
+                iter_count += 1
+
                 # 1. Feed the watchdog.
                 #    This is the FIRST thing in the loop -- if anything below
                 #    takes too long or crashes, the watchdog resets us.
+                phase = "watchdog_feed"
                 watchdog.feed()
 
                 # 2. Update LED pattern (non-blocking).
+                phase = "led_update"
                 led.update()
+
+                # Periodic state log so the operator can see the loop
+                # is actually running. Once every 5 seconds. If the log
+                # goes silent for longer than that, the loop has wedged
+                # somewhere (the last printed phase says where).
+                tick_now = time.ticks_ms()
+                if time.ticks_diff(tick_now, last_tick_log) >= 5000:
+                    print(
+                        "[main] tick | iter=",
+                        iter_count,
+                        "| phase=",
+                        phase,
+                        "| free_ram=",
+                        gc.mem_free(),
+                        "B | uptime=",
+                        time.ticks_diff(tick_now, boot_ticks) // 1000,
+                        "s",
+                    )
+                    last_tick_log = tick_now
 
                 # 3. Poll WebSocket for incoming messages.
                 #    recv() is non-blocking (100ms timeout). It returns None
                 #    if no message is available.
+                phase = "ws_recv"
                 msg = ws.recv()
 
                 if msg is not None:
@@ -479,15 +515,18 @@ def main():
                     # flash looked like the Pico was misbehaving. The LED
                     # is reserved for actual state changes (connecting,
                     # connected, error) and the "identify" command.
+                    phase = "dispatch"
+                    msg_type = msg.get("type") if isinstance(msg, dict) else "?"
+                    print("[main] ws recv |", msg_type)
                     proto.dispatch(msg)
 
                 # 4. Poll TCP relay sessions.
                 #    Check if any target devices have sent data back through
                 #    our relay connections, and forward it to the server.
+                phase = "tcp_relay_poll"
                 if hasattr(proto, "_tcp_relay"):
                     relay_data = proto._tcp_relay.poll_all()
                     for session_id, b64_data in relay_data:
-                        # Send relay data back to the server.
                         ws.send(
                             {
                                 "type": "tcp_relay_data",
@@ -497,12 +536,10 @@ def main():
                         )
 
                 # 5. Send heartbeat if it's time.
-                #    The heartbeat now includes health data so the server can
-                #    display a health dashboard (RAM usage, WiFi signal, uptime,
-                #    reconnection count). This data is stored in Redis cache on
-                #    the server and displayed on the transmitter detail page.
+                phase = "heartbeat_check"
                 now = time.ticks_ms()
                 if time.ticks_diff(now, last_heartbeat) >= heartbeat_interval * 1000:
+                    phase = "heartbeat_send"
                     wifi_info = wifi.get_info() if wifi.is_connected() else None
 
                     # Collect garbage before measuring memory so we get an
@@ -558,26 +595,39 @@ def main():
                     >= per_device_interval
                 )
                 if devices and (due or scan_state["force"]):
+                    phase = "scan_setup"
                     if _scanner is None:
                         from network_scanner import NetworkScanner
                         _scanner = NetworkScanner()
                     idx = scan_state["cursor"] % n
                     target = devices[idx]
                     scan_start = time.ticks_ms()
+                    free_before = gc.mem_free()
                     print(
                         "[main] scan tick |",
                         target.get("name", "?"),
                         "(", idx + 1, "of", n, ") | forced=",
                         scan_state["force"],
+                        "| free_ram=",
+                        free_before,
                     )
                     try:
+                        phase = "scan_probe:" + str(target.get("name", "?"))
                         r = _scanner.check_one(target)
+                        phase = "scan_done"
                         elapsed = time.ticks_diff(time.ticks_ms(), scan_start)
+                        gc.collect()
+                        free_after = gc.mem_free()
                         print(
                             "[main] scan tick done |",
                             elapsed,
                             "ms |",
                             "online" if r.get("online") else "offline",
+                            "| ram delta=",
+                            free_after - free_before,
+                            "B (free now=",
+                            free_after,
+                            ")",
                         )
                         if r.get("public_id"):
                             ws.send(
@@ -599,16 +649,19 @@ def main():
                     scan_state["force"] = False
 
                 # 6. Check WebSocket health (ping/pong).
+                phase = "ws_check_heartbeat"
                 if not ws.check_heartbeat():
                     print("[main] WebSocket heartbeat failed!")
                     break  # Exit inner loop to reconnect.
 
                 # 7. Check WiFi connection.
+                phase = "wifi_check"
                 if not wifi.is_connected():
                     print("[main] WiFi disconnected!")
                     break  # Exit inner loop to reconnect.
 
                 # 8. Check if WebSocket is still connected.
+                phase = "ws_check_connected"
                 if not ws.is_connected():
                     print("[main] WebSocket disconnected!")
                     break  # Exit inner loop to reconnect.

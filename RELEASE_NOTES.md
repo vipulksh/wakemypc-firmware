@@ -1,33 +1,46 @@
-## v0.3.0 — ICMP ping + scan stagger restored
+## v0.3.1 — OTA redirect fix + partial-mask boot log
 
-**Performance:**
-- **3-device overload fixed** (the bug deliberately left in v0.2.1 for
-  reproduction). The round-robin scan stagger from v0.2.0 is back: one
-  device probed per tick, ticks evenly spread across `device_scan_interval`.
-  With 3 devices on a 60s interval that's one probe every ~20s -- and
-  no single tick blocks for more than ~2s.
-- **ICMP Echo pre-flight** for online detection. The scanner now sends
-  one ICMP packet first; on reply (typical home/IoT/printer behaviour),
-  it short-circuits the multi-port TCP walk entirely. Single round-trip,
-  usually <10ms on a LAN.
+**Critical fix:**
+- **OTA over GitHub Releases is now functional.** Previously
+  `http_download` treated any non-200 response as a hard error. GitHub
+  release URLs (`github.com/.../releases/download/...`) always reply
+  302 with a `Location:` pointing at the asset CDN, so OTA against
+  v0.3.0 would have silently failed at the very first byte. The
+  downloader now follows up to 5 redirect hops, refuses
+  HTTPS-to-HTTP downgrades, and refuses non-http(s) Location schemes.
 
-**New module:**
-- `ping.py` — raw-socket ICMP Echo (RFC 792) with proper Internet
-  checksum (RFC 1071) and defensive IP-header parsing on reply. Build-
-  compat guard: if `socket.SOCK_RAW` isn't exposed (stripped MicroPython
-  builds), the scanner latches ICMP off after the first attempt and
-  falls back to TCP probing. You'll see `[scanner] ICMP unavailable,
-  TCP-only: <error>` once and never again.
+**More debug logs throughout the OTA path:**
+- `[ota.http] hop= 0 GET https://...` for every connection attempt
+- `[ota.http]   host= ... port= ... ssl= ...` and the response status
+- `[ota.http]   -> redirect to ...` on every 3xx hop
+- `[ota.http]   downloaded N bytes to <path>` on success
+- `[ota] fetch_manifest:` + manifest version / file count on parse
+- `[ota] update complete: success= ... updated= ...` after the swap
 
-**Logs:**
-- Scanner now prints which path answered:
-  `[scanner] <name> -> online (icmp, 7 ms )`
-  `[scanner] <name> -> online (tcp:80)` / `(tcp-refused:80)`
-  `[scanner] <name> -> offline`
+**WS sanity log:**
+- `[ws] Connecting to ...` now also prints `| tls=True/False`. A
+  plaintext `ws://` connection logs a `WARNING: connecting over
+  plaintext ws://` line so a misprovisioned production Pico is
+  noticeable.
 
-**Reflash and re-import the manifest:**
+**Boot log: partial mask for secrets.**
+The config-load banner now shows the first four characters and the
+length of masked values rather than fully redacting them:
+
+```
+[config]   wifi   = ssid= Buffalo-1CD0 | password= myW1*** (12c) | order= 0
+[config]   token  = 4f3a*** (40c)
+```
+
+Lets you confirm the right token / password is loaded from a shared
+log without enough material to reconstruct the full secret.
+
+**Reflash + reimport manifest** (this is the version that finally
+applies via OTA cleanly, but the v0.3.0 -> v0.3.1 hop itself still
+needs a USB flash because v0.3.0 has the broken downloader):
+
 ```
 wakemypc upload --firmware-dir ./pico_firmware/src/
 docker compose -f docker-compose.local.yml exec django \
-  python manage.py import_firmware_manifest 0.3.0 --mark-latest
+  python manage.py import_firmware_manifest 0.3.1 --mark-latest
 ```
