@@ -1,14 +1,12 @@
-## v0.1.0 — Initial release
+## v0.1.1 — Server protocol alignment
 
-First public release of the WakeMyPC Pico W firmware.
-
-**Features:**
-- WebSocket auth with the wakemypc.com server.
-- Wake-on-LAN: send magic packets to managed devices on the LAN.
-- Device monitoring: TCP-port-probe assigned devices, report online/offline.
-- WiFi configuration over the dashboard (credentials stay on the Pico).
-- SSH-over-WebSocket TCP relay for remote shell access via the Pico.
-- OTA scaffold: download firmware files, sha256-verify, atomic swap.
-- Watchdog + LED status patterns (connecting, connected, error).
-
-**Source-available** under PolyForm Noncommercial 1.0.0.
+**Fixed:**
+- **`firmware_update_available` handler.** When the server told a Pico
+  on outdated firmware that an update was available, the Pico bounced
+  back an "Unknown message type" error -- on every auth, every
+  reconnect. Out-of-date Picos no longer spam the server.
+- **Immediate device scan on assignment change.** When the dashboard
+  added or reassigned a managed device, the Pico used to wait up to
+  60 seconds (next periodic scan) before reporting the new device's
+  status. Now the assignment message triggers an immediate scan, so
+  newly-assigned devices light up in seconds.

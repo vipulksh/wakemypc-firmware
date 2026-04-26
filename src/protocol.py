@@ -142,6 +142,14 @@ class ProtocolHandler:
         # connection failure.
         self._on_wifi_config_set = None
 
+        # Optional callback fired the moment a device_assignment lands.
+        # main.py wires this to force an immediate device scan -- without
+        # it the dashboard waits up to device_scan_interval (60s) before
+        # the newly-assigned devices show their actual online/offline
+        # state. The user expects "I added a device, where is it" to
+        # resolve in seconds, not minutes.
+        self._on_device_assignment = None
+
         # Register built-in handlers that don't depend on external modules.
         self._register_builtins()
 
@@ -209,6 +217,17 @@ class ProtocolHandler:
         # this handler, dashboard reassignments updated only the server
         # DB; the Pico kept pinging the old set forever.
         self._handlers["device_assignment"] = self._handle_device_assignment
+
+        # "firmware_update_available" -- server pushes this on auth_ok
+        # when our reported FIRMWARE_VERSION is older than the latest
+        # released version. Today we just log it; the user triggers the
+        # actual OTA from the dashboard ("Update firmware" button), which
+        # arrives separately as `ota_update`. The handler exists so we
+        # don't bounce back an "Unknown message type" error every time
+        # an out-of-date Pico authenticates.
+        self._handlers["firmware_update_available"] = (
+            self._handle_firmware_update_available
+        )
 
     def register(self, message_type, handler_func):
         """
@@ -482,6 +501,24 @@ class ProtocolHandler:
         devices = message.get("devices") or []
         self.assigned_devices = devices
         print("[proto] device_assignment: now monitoring", len(devices), "devices")
+        if self._on_device_assignment is not None:
+            try:
+                self._on_device_assignment(devices)
+            except Exception as exc:
+                print("[proto] on_device_assignment callback raised:", exc)
+
+    def _handle_firmware_update_available(self, message, proto):
+        """Server has a newer firmware. Log it; the actual OTA arrives
+        as a separate ota_update message when the user clicks the
+        update button in the dashboard. No reply expected.
+        """
+        print(
+            "[proto] firmware_update_available: current=",
+            message.get("current"),
+            " latest=",
+            message.get("latest"),
+            sep="",
+        )
 
     def _handle_auth_fail(self, message, proto):
         """
@@ -665,6 +702,16 @@ class ProtocolHandler:
         toward the new networks.
         """
         self._on_wifi_config_set = callback
+
+    def set_on_device_assignment(self, callback):
+        """Register a callable run every time the server pushes a fresh
+        device_assignment. main.py uses this to force an immediate scan
+        so newly-assigned devices light up online/offline within seconds
+        rather than waiting for the next periodic scan tick.
+
+        Signature: callback(devices: list[dict])
+        """
+        self._on_device_assignment = callback
 
     def _handle_config_update(self, message, proto):
         """

@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.1.0"
+FIRMWARE_VERSION = "0.1.1"
 
 
 # -------------------------------------------------------------------------
@@ -423,7 +423,16 @@ def main():
             # responsive, high enough to not melt a Pico that's
             # monitoring 10+ devices.
             device_scan_interval = config.get("device_scan_interval", 60)
-            last_device_scan = time.ticks_ms()
+            # Wrapped in a dict so the device_assignment callback below
+            # can flip `force` from outside the loop's scope. MicroPython
+            # supports `nonlocal` but dict mutation is the simpler idiom.
+            scan_state = {"last": time.ticks_ms(), "force": False}
+
+            def _force_scan_on_assignment(_devices):
+                scan_state["force"] = True
+
+            proto.set_on_device_assignment(_force_scan_on_assignment)
+
             # Lazy-import the scanner so boot stays light if no devices
             # are assigned yet (it's never imported in that case).
             _scanner = None
@@ -502,10 +511,16 @@ def main():
                 #     The server's _handle_device_status keys off public_id
                 #     to update the per-device online/offline cache that
                 #     drives the dashboard's status indicator.
-                if (
-                    proto.assigned_devices
-                    and time.ticks_diff(now, last_device_scan) >= device_scan_interval * 1000
-                ):
+                #
+                #     `scan_state["force"]` flips to True the moment the
+                #     server pushes a device_assignment, so a freshly
+                #     (un)assigned device's status surfaces in seconds
+                #     instead of waiting up to device_scan_interval.
+                due = (
+                    time.ticks_diff(now, scan_state["last"])
+                    >= device_scan_interval * 1000
+                )
+                if proto.assigned_devices and (due or scan_state["force"]):
                     if _scanner is None:
                         from network_scanner import NetworkScanner
                         _scanner = NetworkScanner(timeout=2)
@@ -526,7 +541,8 @@ def main():
                             ws.send({"type": "device_status", "devices": statuses})
                     except Exception as scan_exc:
                         print("[main] device scan failed:", scan_exc)
-                    last_device_scan = now
+                    scan_state["last"] = now
+                    scan_state["force"] = False
 
                 # 6. Check WebSocket health (ping/pong).
                 if not ws.check_heartbeat():
