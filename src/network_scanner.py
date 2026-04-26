@@ -62,6 +62,13 @@ packets or read the ARP cache. So TCP probing is our best option.
 import socket
 import time
 
+# ICMP ping is a recent addition (see ping.py). The import is guarded so
+# that a stripped firmware without ping.py still loads the scanner.
+try:
+    from ping import ping as _icmp_ping
+except ImportError:
+    _icmp_ping = None
+
 
 # -------------------------------------------------------------------------
 # Default ports to probe
@@ -122,6 +129,11 @@ class NetworkScanner:
         """
         self._timeout = timeout
         self._ports = ports or DEFAULT_PROBE_PORTS
+        # Tri-state: None = not yet probed, True = SOCK_RAW works on this
+        # build, False = build doesn't expose it (skip ICMP forever after).
+        # Detected lazily on first check_one() call so we don't pay the
+        # cost (and don't surface errors) at import time.
+        self._icmp_supported = None
 
     def check_one(self, target, port=80, timeout=1):
         """Single TCP probe of one device. Returns the same result shape
@@ -195,6 +207,30 @@ class NetworkScanner:
             return result
 
         name = target.get("name") or ip
+
+        # ----------------------------------------------------------------
+        # ICMP pre-flight
+        # ----------------------------------------------------------------
+        # ICMP Echo is cheaper and more universal than TCP probing: a
+        # single round-trip (typically <10ms on a LAN) and many devices
+        # (printers, IoT, NAS appliances) reply to ICMP while firewalling
+        # all TCP ports.
+        #
+        # Budget: we cap the ICMP timeout at 0.5s. With the existing
+        # TCP fallback (2 probes * 1s = 2s) the worst-case blocking
+        # becomes 0.5s + 2s = 2.5s -- still comfortably under the 8s
+        # watchdog window documented above.
+        #
+        # If the build doesn't expose SOCK_RAW (unlikely on stock Pico W
+        # firmware but possible on minimal builds), the first attempt
+        # raises OSError; we latch _icmp_supported=False and never try
+        # again on this scanner instance.
+        # Try ICMP first (single round-trip, works through firewalls
+        # that drop TCP). The helper latches itself off on the first
+        # OSError so a stripped build doesn't burn budget every tick.
+        if self._try_icmp(ip, result, name, timeout=0.5):
+            return result
+
         for p, label in ((port, "primary"), (22, "fallback")):
             if p == port and label == "fallback":
                 continue
@@ -211,6 +247,7 @@ class NetworkScanner:
                         time.ticks_ms(), start
                     )
                     result["open_ports"].append(p)
+                    print("[scanner]", name, "-> online (tcp:", p, ")")
                     return result
                 except OSError as e:
                     err = str(e)
@@ -221,15 +258,43 @@ class NetworkScanner:
                         result["response_time_ms"] = time.ticks_diff(
                             time.ticks_ms(), start
                         )
+                        print("[scanner]", name, "-> online (tcp-refused:", p, ")")
                         return result
                 finally:
                     sock.close()
             except Exception:
                 continue
 
-        status = "online" if result["online"] else "offline"
-        print("[scanner]", name, "->", status)
+        print("[scanner]", name, "-> offline")
         return result
+
+    def _try_icmp(self, ip, result, name, timeout=0.5):
+        """Run a single ICMP Echo against ip. On reply, populate result
+        with online=True / service="icmp" / response_time_ms and return
+        True. On timeout, return False (caller falls through to TCP).
+        On OSError (typically SOCK_RAW unavailable), latch ICMP off for
+        the rest of this scanner's life and return False.
+
+        Centralised here so check_one + check_device share the same
+        pre-flight without duplicating the latch/print/parse logic.
+        """
+        if _icmp_ping is None or self._icmp_supported is False:
+            return False
+        try:
+            rtt = _icmp_ping(ip, timeout=timeout)
+        except OSError as e:
+            self._icmp_supported = False
+            print("[scanner] ICMP unavailable, TCP-only:", e)
+            return False
+        # First successful sendto/recv proves SOCK_RAW works.
+        self._icmp_supported = True
+        if rtt is not None:
+            result["online"] = True
+            result["service"] = "icmp"
+            result["response_time_ms"] = rtt
+            print("[scanner]", name, "-> online (icmp,", rtt, "ms )")
+            return True
+        return False
 
     def check_device(self, ip, ports=None):
         """
@@ -267,6 +332,13 @@ class NetworkScanner:
             "service": None,
             "open_ports": [],
         }
+
+        # ICMP pre-flight -- short-circuit on the common case. Saves
+        # the multi-port TCP walk entirely when the host replies to
+        # ping (which most home devices do, and which doesn't depend
+        # on any service being open).
+        if self._try_icmp(ip, result, ip, timeout=0.5):
+            return result
 
         for port_num, service_name, _ in probe_ports:
             start_time = time.ticks_ms()

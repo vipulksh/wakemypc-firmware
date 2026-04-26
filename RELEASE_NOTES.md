@@ -1,40 +1,33 @@
-## v0.2.1 — Debug build
+## v0.3.0 — ICMP ping + scan stagger restored
 
-A diagnostic-focused release built specifically to trace what happens
-when a Pico is asked to monitor several devices at once.
+**Performance:**
+- **3-device overload fixed** (the bug deliberately left in v0.2.1 for
+  reproduction). The round-robin scan stagger from v0.2.0 is back: one
+  device probed per tick, ticks evenly spread across `device_scan_interval`.
+  With 3 devices on a 60s interval that's one probe every ~20s -- and
+  no single tick blocks for more than ~2s.
+- **ICMP Echo pre-flight** for online detection. The scanner now sends
+  one ICMP packet first; on reply (typical home/IoT/printer behaviour),
+  it short-circuits the multi-port TCP walk entirely. Single round-trip,
+  usually <10ms on a LAN.
 
-**Reverted (intentionally):**
-- The round-robin scan stagger from v0.2.0 is **temporarily reverted**
-  in this build. The all-at-once scan is back so the overload bug can
-  be reproduced and observed live in `wakemypc logs`.
+**New module:**
+- `ping.py` — raw-socket ICMP Echo (RFC 792) with proper Internet
+  checksum (RFC 1071) and defensive IP-header parsing on reply. Build-
+  compat guard: if `socket.SOCK_RAW` isn't exposed (stripped MicroPython
+  builds), the scanner latches ICMP off after the first attempt and
+  falls back to TCP probing. You'll see `[scanner] ICMP unavailable,
+  TCP-only: <error>` once and never again.
 
-**New debug instrumentation:**
-- `config.py` prints the loaded config on boot (device_id, server_url,
-  ws_endpoint, configured SSIDs). Secrets are masked: device_token is
-  printed as `***masked***`, WiFi passwords are never logged.
-- `main.py` heartbeat tick prints uptime / free RAM / WiFi RSSI /
-  reconnect count.
-- `main.py` scan loop prints `[main] scan START | N device(s) | forced=…`
-  and `[main] scan END | <ms> ms | <online>/<total> online` so a slow
-  scan is visible as a long gap between START and END.
-- `network_scanner.check_devices` prints per-device timing
-  (`[scanner] <name> -> ONLINE | port= 80 | rt= 7 ms | took= 12 ms`).
-- `ws_client.send` prints message type + size on every outbound frame.
+**Logs:**
+- Scanner now prints which path answered:
+  `[scanner] <name> -> online (icmp, 7 ms )`
+  `[scanner] <name> -> online (tcp:80)` / `(tcp-refused:80)`
+  `[scanner] <name> -> offline`
 
-**OTA:**
-- The Pico now fetches `MANIFEST.json` directly from the GitHub
-  Release referenced by `manifest_url` in the `ota_update` message
-  (instead of the server embedding the file list inline). Single
-  source of truth across server + Pico.
-- Post-install hook support: a manifest entry with
-  `"post_install": true` runs after the file swap; `"delete_after": true`
-  removes the hook from flash. For `secrets.json` migrations on
-  breaking releases.
-
-**CLI:**
-- `wakemypc logs` filters high-frequency lines by default (heartbeat
-  metrics, per-probe timing, per-message dispatch). Pass `--debug` for
-  the full firehose.
-- `wakemypc upload --firmware-dir <path>` auto-falls-through to a
-  `src/` subdirectory so passing the parent dir works without knowing
-  the internal layout.
+**Reflash and re-import the manifest:**
+```
+wakemypc upload --firmware-dir ./pico_firmware/src/
+docker compose -f docker-compose.local.yml exec django \
+  python manage.py import_firmware_manifest 0.3.0 --mark-latest
+```
