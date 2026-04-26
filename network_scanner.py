@@ -240,9 +240,28 @@ class NetworkScanner:
                          {"ip": "192.168.1.20", "name": "NAS"},
                      ]
 
+        IP AUTHORITY:
+        The IP we report back is the IP we successfully connected to
+        (which today equals the input IP -- we don't yet do MAC-based
+        rediscovery if the input is wrong, see TODO below). The server
+        treats this as authoritative: when our reported IP differs from
+        the DB's stored value, the server updates the DB so the dashboard
+        and other Picos see what's actually on the LAN.
+
+        TODO MAC-BASED REDISCOVERY:
+        When a device's known IP stops responding it might have moved
+        (DHCP renewal, user reconfigured), not actually gone offline.
+        Ideal recovery: send ARP-who-has on each IP in the /24, watch
+        for a response with the device's known MAC, report the new IP.
+        MicroPython on RP2040 doesn't expose raw sockets or the cyw43
+        ARP cache, so this isn't trivially doable today. A subnet-wide
+        TCP sweep is feasible but slow (~256 * 2s timeout) and can't
+        verify MAC. For now we rely on the user to update the IP via
+        the dashboard, which propagates as a `device_assignment` push.
+
         Returns:
             List of result dicts (same format as check_device() output,
-            plus the "name" and "mac" from the input).
+            plus the "name", "mac", "public_id" from the input).
 
         NOTE ON PERFORMANCE:
         MicroPython is single-threaded, so we check devices one at a time.
