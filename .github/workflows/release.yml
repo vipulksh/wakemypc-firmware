@@ -29,7 +29,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Minify Python sources for flash
+        # The src/*.py files carry heavy educational comments + docstrings
+        # (intentional -- they're the project's onboarding material). On
+        # the Pico that prose is dead weight: every byte sits in flash and
+        # gets parsed on import. We strip it here so the release assets
+        # the Pico downloads via OTA are as small as possible, while the
+        # repo source stays human-readable.
+        #
+        # python-minifier flags:
+        #   --remove-literal-statements: drops module/class/function docstrings
+        #   (default) renames local variables, removes comments, packs whitespace
+        #   (default) does NOT rename globals -- cross-module imports rely on them
+        run: |
+          set -euo pipefail
+          pip install --quiet python-minifier
+          mkdir -p dist
+          total_src=0
+          total_dist=0
+          for f in src/*.py; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            python -m python_minifier --remove-literal-statements "$f" > "dist/$base"
+            src_sz=$(wc -c < "$f")
+            dist_sz=$(wc -c < "dist/$base")
+            total_src=$((total_src + src_sz))
+            total_dist=$((total_dist + dist_sz))
+            pct=$(( 100 * dist_sz / src_sz ))
+            printf "  %-25s %7d -> %7d bytes (%3d%%)\n" \
+              "$base" "$src_sz" "$dist_sz" "$pct"
+          done
+          if [ "$total_src" -gt 0 ]; then
+            total_pct=$(( 100 * total_dist / total_src ))
+          else
+            total_pct=0
+          fi
+          printf "  %-25s %7d -> %7d bytes (%3d%%)\n" \
+            "TOTAL" "$total_src" "$total_dist" "$total_pct"
 
       - name: Build MANIFEST.json
         id: manifest
@@ -47,7 +90,7 @@ jobs:
             # express. The file is attached to the release unchanged.
             echo "Using committed MANIFEST.json (manual override)"
           else
-            # Auto-generate from src/*.py.
+            # Auto-generate from dist/*.py (minified flash payload).
             # Read release metadata from release_config.json.
             # min_compat_version: bump when a release requires a migration
             #   or ABI change that older firmware can't safely skip.
@@ -55,8 +98,10 @@ jobs:
             min_compat=$(jq -r '.min_compat_version // "0.0.0"' release_config.json 2>/dev/null || echo "0.0.0")
             tier=$(jq -r '.tier_required // "free"' release_config.json 2>/dev/null || echo "free")
 
+            # Hash the MINIFIED files: that's what the Pico downloads and
+            # verifies, so the manifest checksum must match the on-wire bytes.
             files=$(
-              cd src
+              cd dist
               for f in *.py; do
                 [ -f "$f" ] || continue
                 hash=$(sha256sum "$f" | cut -d' ' -f1)
@@ -81,11 +126,13 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ steps.manifest.outputs.version }}
           body_path: RELEASE_NOTES.md
+          # Upload the minified files (flat filenames -- Pico expects
+          # main.py, not dist/main.py, when it fetches release assets).
           files: |
             MANIFEST.json
-            src/*.py
+            dist/*.py

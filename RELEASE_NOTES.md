@@ -1,46 +1,58 @@
-## v0.3.1 — OTA redirect fix + partial-mask boot log
+## v0.3.2 — OTA actually completes now
 
-**Critical fix:**
-- **OTA over GitHub Releases is now functional.** Previously
-  `http_download` treated any non-200 response as a hard error. GitHub
-  release URLs (`github.com/.../releases/download/...`) always reply
-  302 with a `Location:` pointing at the asset CDN, so OTA against
-  v0.3.0 would have silently failed at the very first byte. The
-  downloader now follows up to 5 redirect hops, refuses
-  HTTPS-to-HTTP downgrades, and refuses non-http(s) Location schemes.
+**The fix.** v0.3.1 made OTA *attempt* to work (redirect handling), but
+the rp2 8s hardware watchdog could fire mid-update during long synchronous
+TLS downloads. Symptom: the Pico would reboot somewhere between
+`log_buffer.py` and `main.py`, leaving the firmware in a half-installed
+state until rollback kicked in. v0.3.2 plumbs `watchdog.feed()` through
+the whole OTA pipeline so the WDT keeps getting fed during DNS, TCP
+connect, TLS handshake, request send, and every single recv() chunk.
 
-**More debug logs throughout the OTA path:**
-- `[ota.http] hop= 0 GET https://...` for every connection attempt
-- `[ota.http]   host= ... port= ... ssl= ...` and the response status
-- `[ota.http]   -> redirect to ...` on every 3xx hop
-- `[ota.http]   downloaded N bytes to <path>` on success
-- `[ota] fetch_manifest:` + manifest version / file count on parse
-- `[ota] update complete: success= ... updated= ...` after the swap
+**What changed in OTA:**
+- `http_download`, `fetch_manifest`, and `OTAUpdater` accept an optional
+  `feed_watchdog` callback. `main.py` stashes `watchdog.feed` on
+  `proto._feed_watchdog` after each successful boot, and the OTA
+  handler reads it from there.
+- The callback fires before every potentially-slow socket op:
+  resolving DNS, opening the TCP connection, the TLS handshake, sending
+  the GET, receiving the response headers, and each 1KB body chunk.
+- Socket timeout tightened from 30s -> 15s. A stuck connection now
+  fails faster than the WDT.
+- New phase prints (`resolving DNS`, `connecting TCP`, `TLS handshake`)
+  so the next stall narrows the suspect window before reboot rather
+  than vanishing into one silent recv().
 
-**WS sanity log:**
-- `[ws] Connecting to ...` now also prints `| tls=True/False`. A
-  plaintext `ws://` connection logs a `WARNING: connecting over
-  plaintext ws://` line so a misprovisioned production Pico is
-  noticeable.
-
-**Boot log: partial mask for secrets.**
-The config-load banner now shows the first four characters and the
-length of masked values rather than fully redacting them:
+**Reset cause logging at boot.** `machine.reset_cause()` is now printed
+on every boot. WDT-induced resets get a banner so they're impossible to
+miss in `wakemypc logs --catch-up`:
 
 ```
-[config]   wifi   = ssid= Buffalo-1CD0 | password= myW1*** (12c) | order= 0
-[config]   token  = 4f3a*** (40c)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! Last reset: WATCHDOG (timeout)
+!! Something blocked the main loop > 8s.
+!! Check the last printed phase before the reset.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ```
 
-Lets you confirm the right token / password is loaded from a shared
-log without enough material to reconstruct the full secret.
+**Smaller flash footprint.** The release workflow now minifies every
+`src/*.py` through `python-minifier` (drops comments, docstrings, and
+whitespace; renames locals; preserves global names so cross-module
+imports keep working). The repo source stays human-readable; the bytes
+that hit flash are the lean version. Expect ~30-50% smaller files.
 
-**Reflash + reimport manifest** (this is the version that finally
-applies via OTA cleanly, but the v0.3.0 -> v0.3.1 hop itself still
-needs a USB flash because v0.3.0 has the broken downloader):
+**Apply path:**
+
+OTA from v0.3.1 should work end-to-end this time. If you're on v0.3.0
+or older, USB-flash first -- v0.3.0 had a broken downloader and can't
+fetch its own update.
+
+```
+docker compose -f docker-compose.local.yml exec django \
+  python manage.py import_firmware_manifest 0.3.2 --mark-latest
+```
+
+Or USB:
 
 ```
 wakemypc upload --firmware-dir ./pico_firmware/src/
-docker compose -f docker-compose.local.yml exec django \
-  python manage.py import_firmware_manifest 0.3.1 --mark-latest
 ```
