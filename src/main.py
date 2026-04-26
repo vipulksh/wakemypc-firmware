@@ -131,6 +131,37 @@ def boot(reuse=None):
     # (which it isn't).
     is_partial = bool(reuse and reuse.get("wifi") and reuse["wifi"].is_connected())
     if not is_partial:
+        # Print why we just rebooted. machine.reset_cause() returns one
+        # of PWRON_RESET / HARD_RESET / WDT_RESET / DEEPSLEEP_RESET /
+        # SOFT_RESET. Logging this loudly at the top of boot makes
+        # watchdog-induced resets obvious in the serial stream (and in
+        # the log_buffer that wakemypc logs --catch-up dumps), so
+        # crashes attributed to 'the Pico died' don't have to be
+        # diagnosed by guessing.
+        try:
+            import machine as _m
+
+            cause_id = _m.reset_cause()
+            cause_map = {
+                getattr(_m, "PWRON_RESET", -1): "POWER-ON",
+                getattr(_m, "HARD_RESET", -1): "HARD (machine.reset)",
+                getattr(_m, "WDT_RESET", -1): "WATCHDOG (timeout)",
+                getattr(_m, "DEEPSLEEP_RESET", -1): "DEEPSLEEP wake",
+                getattr(_m, "SOFT_RESET", -1): "SOFT (Ctrl+D)",
+            }
+            cause_name = cause_map.get(cause_id, "unknown ({})".format(cause_id))
+            if cause_id == getattr(_m, "WDT_RESET", -1):
+                # Loud banner so it can't be missed in a long log.
+                print("!" * 50)
+                print("!! Last reset:", cause_name)
+                print("!! Something blocked the main loop > 8s.")
+                print("!! Check the last printed phase before the reset.")
+                print("!" * 50)
+            else:
+                print("[boot] Last reset:", cause_name)
+        except Exception as exc:
+            print("[boot] Could not read reset cause:", exc)
+
         print("=" * 50)
         print("WakeMyPC Pico Firmware v" + FIRMWARE_VERSION)
         print("=" * 50)
@@ -409,6 +440,13 @@ def main():
             if not watchdog._started:
                 watchdog.start()
 
+            # Hand the WDT to handlers that do long synchronous I/O.
+            # ota_updater.handle_ota_update reads proto._feed_watchdog
+            # and pulses it during downloads/TLS handshakes so a
+            # multi-file OTA can't blow the 8s WDT mid-fetch.
+            if proto is not None:
+                proto._feed_watchdog = watchdog.feed
+
             # If boot failed to establish a WebSocket connection, wait and retry.
             if not ws or not proto:
                 print("[main] Boot incomplete, retrying in", reconnect_delay, "seconds")
@@ -551,12 +589,27 @@ def main():
                     # These let the server dashboard show the Pico's internal
                     # state: how much RAM is free, WiFi signal quality, how
                     # long it's been running, and how stable the connection is.
+                    # Flash info via os.statvfs("/"). Lets the dashboard
+                    # warn the user when the Pico is running low on flash
+                    # (OTA needs ~2x the firmware size for staging).
+                    try:
+                        import os as _os
+
+                        st = _os.statvfs("/")
+                        flash_free = st[0] * st[3]
+                        flash_total = st[0] * st[2]
+                    except Exception:
+                        flash_free = 0
+                        flash_total = 0
+
                     health = {
                         "free_ram": gc.mem_free(),
                         "total_ram": gc.mem_free() + gc.mem_alloc(),
                         "wifi_rssi": wifi.get_rssi() if hasattr(wifi, 'get_rssi') else None,
                         "uptime_seconds": time.ticks_diff(time.ticks_ms(), boot_ticks) // 1000,
                         "reconnect_count": reconnect_count,
+                        "flash_free": flash_free,
+                        "flash_total": flash_total,
                     }
 
                     print(
@@ -564,6 +617,8 @@ def main():
                         health["uptime_seconds"],
                         "s | free_ram=",
                         health["free_ram"],
+                        "B | flash_free=",
+                        flash_free,
                         "B | rssi=",
                         health["wifi_rssi"],
                         "| reconnects=",

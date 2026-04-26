@@ -805,6 +805,8 @@ class ProtocolHandler:
         except Exception:
             unique_id = "unknown"
 
+        flash_info = _get_flash_info()
+
         proto.send_response(
             "status",
             {
@@ -814,7 +816,35 @@ class ProtocolHandler:
                 "mem_free": mem_free,
                 "mem_alloc": mem_alloc,
                 "mem_pct_used": round(mem_alloc / (mem_free + mem_alloc) * 100, 1),
+                "flash_free": flash_info["free"],
+                "flash_total": flash_info["total"],
+                "flash_pct_used": flash_info["pct_used"],
                 "messages_handled": self._message_count,
                 "firmware_version": "1.0.0",
             },
         )
+
+
+def _get_flash_info():
+    """Return free / total / used-percent of the on-flash filesystem.
+
+    Uses os.statvfs("/"), which on MicroPython returns a tuple where
+    f_bsize (block size) and f_bfree / f_blocks are the values we need.
+    Returns zeros if the call fails so callers don't have to deal with
+    None.
+    """
+    try:
+        import os as _os
+
+        st = _os.statvfs("/")
+        # f_bsize=0, f_frsize=1, f_blocks=2, f_bfree=3 (per POSIX statvfs)
+        block_size = st[0]
+        total_blocks = st[2]
+        free_blocks = st[3]
+        total = block_size * total_blocks
+        free = block_size * free_blocks
+        used = total - free
+        pct = round(used * 100 / total, 1) if total else 0.0
+        return {"free": free, "total": total, "pct_used": pct}
+    except Exception:
+        return {"free": 0, "total": 0, "pct_used": 0.0}

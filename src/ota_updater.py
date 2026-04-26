@@ -163,7 +163,8 @@ def file_sha256(filepath):
         return None
 
 
-def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
+def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5,
+                  feed_watchdog=None):
     """
     Download a file from an HTTP(S) URL and save it to the filesystem,
     following redirects.
@@ -173,17 +174,23 @@ def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
         dest_path:     where to save the file on the Pico's flash
         max_size:      maximum allowed file size in bytes
         max_redirects: how many 3xx redirects to follow before giving up
+        feed_watchdog: optional zero-arg callable that the caller wires
+                       to its WDT.feed(). Called before every potentially
+                       slow socket op (DNS, connect, TLS handshake, recv).
+                       Without this, multi-file OTAs over TLS would blow
+                       the rp2 8s hardware watchdog -- the main-loop's
+                       feed only runs between WS messages, not during a
+                       synchronous handler.
 
     Returns (success: bool, error_message: str or None)
-
-    Why the explicit redirect loop matters: GitHub release asset URLs
-    (https://github.com/<owner>/<repo>/releases/download/<tag>/<file>)
-    ALWAYS reply 302 Found with a Location: pointing at a CDN host
-    (objects.githubusercontent.com or similar). The previous version
-    of this function treated any non-200 status as a hard error, so
-    OTA against GitHub releases silently failed on the very first
-    byte of every attempt. Now we follow up to max_redirects hops.
     """
+    def _feed():
+        if feed_watchdog is not None:
+            try:
+                feed_watchdog()
+            except Exception:
+                pass
+
     current_url = url
     for hop in range(max_redirects + 1):
         print("[ota.http] hop=", hop, "GET", current_url)
@@ -206,13 +213,20 @@ def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
                 port = 443 if use_ssl else 80
 
             print("[ota.http]   host=", host, "port=", port, "ssl=", use_ssl)
+            _feed()
+            print("[ota.http]   resolving DNS...")
             addr = socket.getaddrinfo(host, port)[0][-1]
+            _feed()
+            print("[ota.http]   connecting TCP...")
             sock = socket.socket()
-            sock.settimeout(30)
+            sock.settimeout(15)
             sock.connect(addr)
+            _feed()
 
             if use_ssl:
+                print("[ota.http]   TLS handshake...")
                 sock = ssl.wrap_socket(sock, server_hostname=host)
+                _feed()
 
             request = (
                 "GET {path} HTTP/1.0\r\nHost: {host}\r\n"
@@ -220,9 +234,11 @@ def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
                 "Connection: close\r\n\r\n"
             ).format(path=path, host=host)
             sock.send(request.encode())
+            _feed()
 
             response = b""
             while b"\r\n\r\n" not in response:
+                _feed()
                 chunk = sock.recv(1024)
                 if not chunk:
                     sock.close()
@@ -295,6 +311,7 @@ def http_download(url, dest_path, max_size=MAX_FILE_SIZE, max_redirects=5):
                     total_bytes += len(body_start)
 
                 while True:
+                    _feed()
                     chunk = sock.recv(1024)
                     if not chunk:
                         break
@@ -342,9 +359,22 @@ class OTAUpdater:
             machine.reset()  # Reboot to load new code
     """
 
-    def __init__(self):
+    def __init__(self, feed_watchdog=None):
         # Ensure the backup directory exists.
         ensure_dir(BACKUP_DIR)
+        # Optional zero-arg callback that pulses the hardware WDT. Wired
+        # through main.py so the WDT keeps getting fed during the long
+        # synchronous OTA pipeline (downloads, TLS handshakes, hashing).
+        # Without it the rp2 8s WDT fires somewhere mid-OTA -- exactly
+        # the crash we saw between log_buffer.py and main.py downloads.
+        self._feed_watchdog = feed_watchdog
+
+    def _feed(self):
+        if self._feed_watchdog is not None:
+            try:
+                self._feed_watchdog()
+            except Exception:
+                pass
 
     def update(self, files):
         """
@@ -395,7 +425,9 @@ class OTAUpdater:
             temp_path = filename + ".ota"
             print("[ota] Downloading:", filename)
 
-            success, error = http_download(url, temp_path)
+            success, error = http_download(
+                url, temp_path, feed_watchdog=self._feed_watchdog
+            )
             if not success:
                 # Clean up temp files and abort.
                 self._cleanup_temp_files(temp_files)
@@ -422,34 +454,60 @@ class OTAUpdater:
                     }
                 print("[ota] Checksum verified:", filename)
 
-        # PHASE 3: Back up current files and replace them.
+        # PHASE 3a: Sweep stale backups from the previous successful
+        # update. Without this, /backup/ keeps growing release after
+        # release. We keep one revision back -- the version we are
+        # about to upgrade FROM -- which is always the freshest set of
+        # backups. Older sets are tossed.
+        self._sweep_old_backups()
+
+        # PHASE 3b: Back up current files and replace them.
+        # Track installed_so_far so we can undo on partial failure --
+        # the previous version of this loop only restored the file
+        # that failed, leaving any earlier successfully-installed
+        # files in place. That left the firmware in a half-updated
+        # state: some files at the new version, some at the old, and
+        # nothing on the next reboot to recover.
         updated = []
+        installed_so_far = []  # [(filename, backup_existed: bool), ...]
         for tf in temp_files:
             filename = tf["filename"]
             temp_path = tf["temp_path"]
             backup_path = BACKUP_DIR + "/" + filename
 
             # Back up the current file (if it exists).
+            backup_existed = False
             try:
                 os.rename(filename, backup_path)
                 print("[ota] Backed up:", filename, "->", backup_path)
+                backup_existed = True
             except OSError:
-                # File doesn't exist yet (new file). That's fine.
-                pass
+                # File doesn't exist yet (new file in this release).
+                # Logged so an operator scanning the OTA trace can tell
+                # 'no backup' from 'forgot to back up'.
+                print("[ota] No prior version, skipping backup:", filename)
 
             # Move the temp file to the final location.
             try:
                 os.rename(temp_path, filename)
                 updated.append(filename)
+                installed_so_far.append((filename, backup_existed))
                 print("[ota] Installed:", filename)
             except OSError as e:
                 print("[ota] ERROR installing", filename, ":", e)
-                # Try to restore from backup.
-                try:
-                    os.rename(backup_path, filename)
-                    print("[ota] Restored backup for:", filename)
-                except OSError:
-                    pass
+                # Restore EVERYTHING we replaced this run -- not just
+                # the failed file. Otherwise the firmware ends up at a
+                # mix of old + new modules and probably fails on next
+                # boot.
+                self._rollback(filename, installed_so_far)
+                self._cleanup_temp_files(temp_files)
+                return {
+                    "success": False,
+                    "message": "Install failed for {}: {} (rolled back)".format(
+                        filename, e
+                    ),
+                    "updated": [],
+                }
 
         print("[ota] Update complete.", len(updated), "files updated")
 
@@ -494,6 +552,63 @@ class OTAUpdater:
             except OSError:
                 pass
 
+    def _rollback(self, failed_filename, installed_so_far):
+        """Restore every file that was successfully installed in this
+        update run, then delete the failed-file's leftover. Called when
+        a single os.rename fails mid-install.
+
+        installed_so_far is a list of (filename, backup_existed) tuples
+        in install order. We undo in install order (rather than reverse
+        order) because each rename is independent -- the order doesn't
+        matter for correctness, only for log readability.
+        """
+        print("[ota] rollback: restoring", len(installed_so_far), "file(s)")
+        for filename, backup_existed in installed_so_far:
+            backup_path = BACKUP_DIR + "/" + filename
+            # First remove the new file we just installed.
+            try:
+                os.remove(filename)
+                print("[ota]   removed installed:", filename)
+            except OSError:
+                pass
+            # Then restore the backup if there was one.
+            if backup_existed:
+                try:
+                    os.rename(backup_path, filename)
+                    print("[ota]   restored:", filename)
+                except OSError as e:
+                    print("[ota]   FAILED to restore", filename, ":", e)
+            else:
+                print("[ota]   was a new file, no backup to restore:", filename)
+        # The failed file itself: remove any leftover .ota or partial.
+        try:
+            os.remove(failed_filename + ".ota")
+        except OSError:
+            pass
+
+    def _sweep_old_backups(self):
+        """Clear /backup/ before a new update writes fresh ones.
+
+        We keep AT MOST one revision back: the version you are upgrading
+        FROM. Without this sweep, /backup/ accumulates files release
+        after release and eats flash. The cost of clearing here is
+        that a successful update no longer leaves N versions of
+        history -- the prior /backup/ becomes inaccessible. That's
+        fine: by the time you're triggering a new update, you've
+        already validated the running version.
+        """
+        try:
+            entries = os.listdir(BACKUP_DIR)
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                os.remove(BACKUP_DIR + "/" + entry)
+            except OSError:
+                pass
+        if entries:
+            print("[ota] swept", len(entries), "stale backup(s)")
+
     def get_file_versions(self):
         """
         Get a dict of current file checksums (useful for the server to know
@@ -510,7 +625,7 @@ class OTAUpdater:
         return versions
 
 
-def fetch_manifest(manifest_url):
+def fetch_manifest(manifest_url, feed_watchdog=None):
     """Download and parse MANIFEST.json from a GitHub Release URL.
 
     Returns a list of {"filename", "url", "checksum"} dicts ready for
@@ -521,7 +636,9 @@ def fetch_manifest(manifest_url):
     of truth for what files ship in each release.
     """
     print("[ota] fetch_manifest:", manifest_url)
-    success, error = http_download(manifest_url, "/tmp_manifest.json")
+    success, error = http_download(
+        manifest_url, "/tmp_manifest.json", feed_watchdog=feed_watchdog
+    )
     if not success:
         raise Exception("Failed to download manifest: " + str(error))
 
@@ -590,13 +707,18 @@ def handle_ota_update(message, proto):
     files = message.get("files", [])
     version = message.get("version", "?")
 
+    # main.py stashes watchdog.feed on proto so we can keep the rp2 8s
+    # WDT alive across the long synchronous OTA pipeline. getattr keeps
+    # the handler usable in tests / older firmware where it's absent.
+    feed_wdt = getattr(proto, "_feed_watchdog", None)
+
     print("[ota] handle_ota_update: version=", version,
           "manifest_url=", "yes" if manifest_url else "no",
           "inline_files=", len(files))
 
     if manifest_url:
         try:
-            files = fetch_manifest(manifest_url)
+            files = fetch_manifest(manifest_url, feed_watchdog=feed_wdt)
         except Exception as e:
             print("[ota] manifest fetch failed:", e)
             proto.send_response(
@@ -622,7 +744,7 @@ def handle_ota_update(message, proto):
         return
 
     print("[ota] beginning update of", len(files), "file(s) for v" + str(version))
-    updater = OTAUpdater()
+    updater = OTAUpdater(feed_watchdog=feed_wdt)
     result = updater.update(files)
     result["version"] = version
     print(
