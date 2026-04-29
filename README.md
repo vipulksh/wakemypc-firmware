@@ -45,16 +45,8 @@ If you don't trust this design or don't want SSH-based shutdown: **don't configu
 
 ## Flashing a Pico
 
-You need [`wakemypc-cli`](https://github.com/<owner>/wakemypc-cli) to install MicroPython and copy this firmware to the Pico. The CLI handles BOOTSEL, file transfer, secrets provisioning, and registration.
-
-```bash
-pip install git+https://github.com/<owner>/wakemypc-cli.git
-wakemypc detect                  # plug the Pico in BOOTSEL mode
-wakemypc flash --uf2 <path>      # install MicroPython
-wakemypc upload --firmware-dir ./src/   # copy this firmware
-wakemypc provision --server-url wss://wakemypc.com --add-new-wifi --wifi-ssid <SSID> --wifi-pass <PASS>
-wakemypc register --api-url https://wakemypc.com --username <you> --password <pw>
-```
+You need [`wakemypc-cli`](https://github.com/vipulksh/wakemypc-cli) to install MicroPython and copy this firmware to the Pico. The CLI handles BOOTSEL, file transfer, secrets provisioning, and registration.
+Check out the link to know how to get going.
 
 Or grab a release artifact and copy the .py files manually with [`mpremote`](https://docs.micropython.org/en/latest/reference/mpremote.html):
 
@@ -67,13 +59,13 @@ mpremote connect /dev/ttyACM0 reset
 
 When the server has a newer firmware version available and the Pico's user is on a tier that has access to it, the server sends a manifest with download URLs and sha256 checksums. The Pico:
 
-1. Downloads each file to a `/staging/` directory.
+1. Downloads each file to a the pico as `<file>.ota`
 2. Verifies the sha256 of every file.
-3. Atomically renames `/staging/<f>` to `/<f>` for each file.
+3. Atomically renames `<file>.ota` to `/<f>` for each file.
 4. Runs any post-install hooks (e.g. `secrets.json` schema migrations).
 5. `machine.reset()`.
 
-If anything fails before the rename phase, nothing changes. If the device reboots mid-rename (unusual), `/backup/` and `/staging/` both still have intact copies.
+If anything fails before the rename phase, nothing changes. If the device reboots mid-rename (unusual), `/backup/` still have intact copies.
 
 You can verify a release's checksums against your installed files:
 
