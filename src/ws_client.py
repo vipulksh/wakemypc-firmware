@@ -62,8 +62,14 @@ MicroPython supports TLS via the `ssl` (or `ussl`) module, but with limitations:
 # -------------------------------------------------------------------------
 # Imports
 # -------------------------------------------------------------------------
+import errno
 import socket  # Raw TCP socket operations (MicroPython's usocket)
 import time  # For delays and timeouts
+
+try:
+    import uselect as select
+except ImportError:
+    import select
 
 # `ssl` (or `ussl` in MicroPython) wraps a plain TCP socket in TLS encryption.
 # This is how "wss://" works -- it's a WebSocket running inside a TLS tunnel.
@@ -146,7 +152,18 @@ class WebSocketClient:
         self._host, self._port, self._path, self._use_ssl = self._parse_url(url)
 
         # The underlying TCP socket (None when not connected).
+        # For wss://, this becomes an SSLSocket after the TLS handshake.
         self._sock = None
+
+        # Reference to the plain TCP socket before it was wrapped in TLS.
+        #
+        # Why we need this:
+        # ssl.wrap_socket() replaces self._sock with an SSLSocket. MicroPython's
+        # SSLSocket does not implement settimeout(), so after the wrap we can no
+        # longer call self._sock.settimeout(). We keep self._raw_sock pointing at
+        # the original TCP socket so we can still control its timeout (e.g. reset
+        # it to blocking after the handshake -- see _handshake_once).
+        self._raw_sock = None
 
         # Buffer for accumulating partial frames.
         self._recv_buf = b""
@@ -342,11 +359,14 @@ class WebSocketClient:
             # socket.AF_INET = IPv4
             # socket.SOCK_STREAM = TCP (as opposed to SOCK_DGRAM for UDP)
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Save the raw socket now, before ssl.wrap_socket() replaces
+            # self._sock with an SSLSocket. We need this reference later to
+            # call settimeout() -- SSLSocket doesn't support it.
+            self._raw_sock = self._sock
 
-            # Set a generous timeout for connect + handshake so we don't
-            # hang for two minutes on an unreachable host. Same pattern as
-            # ota_updater.py, ping.py, network_scanner.py, tcp_relay.py.
-            self._sock.settimeout(5)
+            # 5-second timeout for the TCP connect and TLS handshake so we
+            # don't hang for the OS default (~2 minutes) on an unreachable host.
+            self._raw_sock.settimeout(5)
 
             # Connect to the server. This performs the TCP 3-way handshake:
             # Client: SYN -> Server: SYN-ACK -> Client: ACK
@@ -376,6 +396,9 @@ class WebSocketClient:
             ws_key = binascii.b2a_base64(os.urandom(16)).strip()
 
             # Build the HTTP upgrade request.
+            # User-Agent is required by Cloudflare's bot detection -- without it,
+            # Cloudflare silently closes non-browser WebSocket connections after
+            # a short idle period even though the initial handshake succeeds.
             request = (
                 "GET {path} HTTP/1.1\r\n"
                 "Host: {host}\r\n"
@@ -383,6 +406,7 @@ class WebSocketClient:
                 "Connection: Upgrade\r\n"
                 "Sec-WebSocket-Key: {key}\r\n"
                 "Sec-WebSocket-Version: 13\r\n"
+                "User-Agent: WakeMyPC-Pico/1.0\r\n"
                 "\r\n"
             ).format(
                 path=self._path,
@@ -417,9 +441,36 @@ class WebSocketClient:
                 self._reconnect_attempts = 0
                 self._last_pong_time = time.ticks_ms()
 
-                # Short timeout for steady-state recv. Same pattern the rest
-                # of the firmware uses (e.g. tcp_relay.py: settimeout(0.05)).
-                self._sock.settimeout(0.1)
+                # THE MBED-TLS / SETTIMEOUT BUG -- why we reset to blocking here:
+                #
+                # The naive approach is to call settimeout(0.1) on the raw socket
+                # after the handshake so that recv() returns quickly when there is
+                # no data (non-blocking style). This works on a plain TCP socket
+                # but silently breaks wss:// connections on MicroPython.
+                #
+                # MicroPython's TLS stack (mbedTLS) reads a TLS record by making
+                # multiple recv() calls on the underlying TCP socket -- one for the
+                # 5-byte TLS header, then one or more for the encrypted payload.
+                # If the raw socket has a short timeout and the second recv() fires
+                # after that timeout has elapsed, the underlying socket returns
+                # EAGAIN. mbedTLS treats that as an error, aborts the current record
+                # read, and surfaces the EAGAIN to the caller.
+                #
+                # The TCP data for that record is now in a half-consumed state:
+                # mbedTLS has read the header but not the payload. On the next call
+                # to recv(), mbedTLS starts a fresh record read -- but the socket
+                # still has the payload bytes from the previous record sitting in
+                # the TCP buffer. mbedTLS now misinterprets that payload as the
+                # start of a new TLS record header, corrupting the TLS stream for
+                # all future reads. In practice this means the Pico connects,
+                # sends auth, but never receives auth_ok -- or any other message --
+                # because every incoming TLS record gets silently discarded.
+                #
+                # Fix: keep the socket fully blocking so mbedTLS can always finish
+                # reading a complete TLS record in one go. Non-blocking behaviour
+                # for the main loop is achieved by calling select() with a short
+                # timeout BEFORE recv() -- see recv() below.
+                self._raw_sock.settimeout(None)
 
                 print("[ws] Connected!")
                 return True
@@ -634,9 +685,30 @@ class WebSocketClient:
             return None
 
         try:
+            # Poll for incoming data with a short timeout before blocking recv.
+            #
+            # The socket is kept in blocking mode (see the settimeout(None) in
+            # _handshake_once for the full explanation). That means a bare
+            # self._sock.recv() call would stall the main loop indefinitely
+            # whenever the server has nothing to send. select() lets us ask
+            # "is there data ready right now?" and bail out quickly if not,
+            # keeping the main loop responsive without putting the socket into
+            # non-blocking mode (which would break mbedTLS as described above).
+            try:
+                r, _, _ = select.select([self._sock], [], [], 0.05)
+                if not r:
+                    return None  # No data in 50ms -- yield back to main loop.
+            except Exception:
+                pass  # select unavailable; fall through to blocking recv
+
             # Try to read frame header (at least 2 bytes).
             header = self._sock.recv(2)
-            if not header or len(header) < 2:
+            if not header:
+                # Empty bytes from recv() means the server closed the TCP connection.
+                print("[ws] Connection closed by server (recv returned empty)")
+                self._connected = False
+                return None
+            if len(header) < 2:
                 return None
 
             # Parse the first byte.
@@ -712,8 +784,13 @@ class WebSocketClient:
                 # Unknown opcode, ignore.
                 return None
 
-        except OSError:
-            # Timeout (no data available) -- this is normal for non-blocking recv.
+        except OSError as e:
+            # errno 110 = ETIMEDOUT, 11 = EAGAIN -- no data yet, normal for non-blocking.
+            # Any other OSError (ECONNRESET, EPIPE, etc.) means the connection is dead.
+            if e.args[0] in (errno.ETIMEDOUT, errno.EAGAIN, 11, 110):
+                return None
+            print("[ws] Recv error (connection lost):", e)
+            self._connected = False
             return None
         except Exception as e:
             print("[ws] Recv error:", e)
@@ -810,24 +887,10 @@ class WebSocketClient:
 
         This prevents overwhelming the server if it's under load or restarting.
         """
-        now = time.ticks_ms()
-
-        # Check if it's time to send a ping.
-        if time.ticks_diff(now, self._last_ping_time) > self._ping_interval * 1000:
-            self.send_ping()
-
-        # Check if we're waiting for a pong that's overdue.
-        if self._last_ping_time > 0:
-            since_ping = time.ticks_diff(now, self._last_ping_time)
-            since_pong = time.ticks_diff(now, self._last_pong_time)
-
-            # If we sent a ping more than _pong_timeout ago and haven't
-            # received a pong since before that ping, the connection is dead.
-            if since_ping > self._pong_timeout * 1000 and since_pong > since_ping:
-                print("[ws] Pong timeout -- connection appears dead")
-                self._connected = False
-                return False
-
+        # WS-level ping/pong is disabled: Cloudflare kills the connection when
+        # it sees client-initiated ping frames (opcode 0x9). Dead connections
+        # are detected by recv() returning empty bytes or send() failing on
+        # the application-level heartbeat.
         return True
 
     def get_reconnect_delay(self):
@@ -877,3 +940,4 @@ class WebSocketClient:
             except Exception:
                 pass
             self._sock = None
+        self._raw_sock = None
