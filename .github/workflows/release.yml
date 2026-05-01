@@ -1,125 +1,141 @@
-# Build a MANIFEST.json from src/ and (on a tag push) cut a GitHub Release.
+# Cut a GitHub Release every time a PR merges to main with a new version.
 #
-# When you push a tag like `v0.2.1`, this workflow:
-#  1. Reads release_config.json for min_compat_version + tier_required.
-#  2. Hashes every src/*.py with sha256.
-#  3. Writes MANIFEST.json with paths, URLs, hashes, and the config values.
-#  4. Creates a GitHub Release using RELEASE_NOTES.md as the body.
-#  5. Attaches MANIFEST.json and all src/*.py as release assets.
+# The version comes from the FIRST heading of RELEASE_NOTES.md, which must
+# look like:
 #
-# On a pull request (or push to main), the same build runs WITHOUT cutting
-# a release -- the workflow validates that:
-#   - python-minifier still accepts every src/*.py,
-#   - release_config.json parses,
-#   - MANIFEST.json can be assembled,
-#   - RELEASE_NOTES.md exists.
-# The minified files + manifest are uploaded as workflow artifacts so a
-# reviewer can download them from the PR's "Checks" tab. URLs in the PR
-# manifest point at a tag that doesn't exist yet -- that's expected; we're
-# only verifying the shape, not publishing.
+#     ## v0.3.6 — Fix handling of redirects by `ws_client.py`
 #
-# To change min_compat_version or tier_required for a release:
-#   edit release_config.json, commit, then push the tag.
+# The workflow:
+#   1. Triggers on push to main (i.e. PR-merge or direct push).
+#   2. Parses "v<X.Y.Z>" from the first heading of RELEASE_NOTES.md.
+#   3. If a tag for that version already exists, exits cleanly (idempotent --
+#      re-running the workflow on the same merge does nothing).
+#   4. Minifies src/*.py into dist/*.py.
+#   5. Builds MANIFEST.json from release_config.json + the minified files.
+#   6. Calls softprops/action-gh-release, which atomically creates the
+#      v<version> tag (pointing at this merge commit) AND the GitHub
+#      Release (with RELEASE_NOTES.md as the body, MANIFEST.json + dist/*.py
+#      as assets).
 #
-# To write a release body:
-#   edit RELEASE_NOTES.md, commit, then push the tag.
-#   The file is overwritten each release -- it always reflects the latest.
+# Why no PR-CI trigger here?
+#   This is the *release* workflow. Building + tagging on every PR-open is
+#   the wrong shape -- if you want CI on PRs (linting, syntax checks, etc),
+#   wire that up in a separate workflow file. Mixing release publication
+#   logic into PR-open events is how repos accidentally cut releases from
+#   feature branches.
+#
+# To bump the version:
+#   In your PR, change the first heading of RELEASE_NOTES.md to the new
+#   version (e.g. "## v0.3.7 — ..."). When the PR merges, that's the tag
+#   that gets created.
+#
+# To change min_compat_version or tier_required:
+#   Edit release_config.json and commit alongside the RELEASE_NOTES bump.
 
-name: Build & release firmware
+name: Release firmware
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+  # Manual override -- useful if you need to re-cut a release after fixing
+  # a typo in RELEASE_NOTES.md without producing a new merge commit.
+  workflow_dispatch:
 
-# Top-level permissions are the union of what any job might need.
-# The Release step is gated by `if:` below, so PRs (which GitHub already
-# downgrades to read-only for forks) never actually exercise `contents: write`.
 permissions:
+  # contents: write so action-gh-release can create the tag + release.
   contents: write
 
-# Group concurrent runs per ref so a rapid sequence of PR pushes cancels
-# in-flight builds instead of queuing them. Tag releases keep their own
-# group (they should never be cancelled).
+# Don't allow two release workflow runs on the same ref to race -- the
+# second one would either fail (duplicate tag) or, worse, overwrite assets
+# mid-upload.
 concurrency:
-  group: firmware-build-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: firmware-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.derive_version.outputs.version }}
-      is_release: ${{ steps.derive_version.outputs.is_release }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          # We need the full tag list to detect "already-released versions"
+          # in the skip step below. Default fetch-depth=1 doesn't fetch tags.
+          fetch-depth: 0
+
+      - name: Parse version from RELEASE_NOTES.md
+        id: version
+        # Look at the first non-blank line that starts with "## v<digits>"
+        # and pull the bare version out. Anything else (forgot to bump,
+        # malformed heading, missing file) is a hard error -- we'd rather
+        # fail loudly than silently skip a release the author expected.
+        run: |
+          set -euo pipefail
+          if [ ! -f RELEASE_NOTES.md ]; then
+            echo "::error::RELEASE_NOTES.md is missing"
+            exit 1
+          fi
+          # Match "## vX.Y.Z" anywhere in the leading whitespace of a line.
+          # The pattern allows pre-release suffixes like v1.2.3-rc1 too.
+          version=$(
+            grep -m1 -oE '^##[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?' RELEASE_NOTES.md \
+              | sed -E 's/^##[[:space:]]+v//'
+          ) || true
+          if [ -z "${version:-}" ]; then
+            echo "::error::could not parse 'v<X.Y.Z>' from the first heading of RELEASE_NOTES.md"
+            echo "first 5 lines were:"
+            head -n 5 RELEASE_NOTES.md
+            exit 1
+          fi
+          echo "Parsed version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version"   >> "$GITHUB_OUTPUT"
+
+      - name: Skip if tag already exists
+        id: tag_check
+        # Idempotent re-run guard. If the version in RELEASE_NOTES.md
+        # already has a tag (e.g. someone re-ran this workflow without
+        # bumping), we exit success without doing anything else. The next
+        # bump will trigger a fresh release.
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists -- nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${tag} does not exist; will release."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Python
+        if: steps.tag_check.outputs.skip != 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Derive version + release flag
-        id: derive_version
-        # On a tag push, version is the tag without the leading "v" and we
-        # set is_release=true so the Release step downstream fires. On any
-        # other event (PR, push to main), we tag the manifest as
-        # "dev-<short sha>" so it's obviously not a real release if anyone
-        # downloads the artifact.
+      - name: Validate release_config.json
+        if: steps.tag_check.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME}"
-            version="${tag#v}"
-            is_release=true
-          else
-            version="dev-${GITHUB_SHA::7}"
-            is_release=false
+          if [ ! -f release_config.json ]; then
+            echo "::error::release_config.json is missing"
+            exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
-          echo "Building $version (release=$is_release, event=${GITHUB_EVENT_NAME})"
-
-      - name: Validate required files
-        # Catch missing files early on a PR so a tag push doesn't fail
-        # halfway through. RELEASE_NOTES.md is the GitHub Release body, so
-        # it must exist by tag time -- enforce that on every PR too.
-        run: |
-          set -euo pipefail
-          for f in RELEASE_NOTES.md release_config.json; do
-            if [ ! -f "$f" ]; then
-              echo "::error::missing required file: $f"
-              exit 1
-            fi
-          done
-          # release_config.json must at least parse; the build step pulls
-          # min_compat_version + tier_required out with safe defaults so
-          # missing keys are tolerated, but malformed JSON is not.
           jq empty release_config.json
-          # If a hand-crafted MANIFEST.json is committed, validate that it
-          # at least parses too (the manifest step will use it as-is).
           if [ -f MANIFEST.json ]; then
             jq empty MANIFEST.json
           fi
 
       - name: Minify Python sources for flash
+        if: steps.tag_check.outputs.skip != 'true'
         # The src/*.py files carry heavy educational comments + docstrings
         # (intentional -- they're the project's onboarding material). On
         # the Pico that prose is dead weight: every byte sits in flash and
         # gets parsed on import. We strip it here so the release assets
         # the Pico downloads via OTA are as small as possible, while the
         # repo source stays human-readable.
-        #
-        # python-minifier flags:
-        #   --remove-literal-statements: drops module/class/function docstrings
-        #   (default) renames local variables, removes comments, packs whitespace
-        #   (default) does NOT rename globals -- cross-module imports rely on them
         run: |
           set -euo pipefail
           pip install --quiet python-minifier
@@ -147,20 +163,11 @@ jobs:
             "TOTAL" "$total_src" "$total_dist" "$total_pct"
 
       - name: Build MANIFEST.json
-        # On a tag push, ${tag} resolves to the actual ref and the URLs
-        # baked into the manifest will resolve once the release is created
-        # below. On a PR or branch push, ${tag} is "v<dev-version>" which
-        # won't exist as a release; that's fine because we don't ship the
-        # PR manifest anywhere -- it's only an artifact for inspection.
+        if: steps.tag_check.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          version="${{ steps.derive_version.outputs.version }}"
-          is_release="${{ steps.derive_version.outputs.is_release }}"
-          if [ "$is_release" = "true" ]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="v${version}"
-          fi
+          version="${{ steps.version.outputs.version }}"
+          tag="${{ steps.version.outputs.tag }}"
           repo="${GITHUB_REPOSITORY}"
           base_url="https://github.com/${repo}/releases/download/${tag}"
 
@@ -172,15 +179,9 @@ jobs:
             echo "Using committed MANIFEST.json (manual override)"
           else
             # Auto-generate from dist/*.py (minified flash payload).
-            # Read release metadata from release_config.json.
-            # min_compat_version: bump when a release requires a migration
-            #   or ABI change that older firmware can't safely skip.
-            # tier_required: set to "supporter" to gate a beta to paying users.
-            min_compat=$(jq -r '.min_compat_version // "0.0.0"' release_config.json 2>/dev/null || echo "0.0.0")
-            tier=$(jq -r '.tier_required // "free"' release_config.json 2>/dev/null || echo "free")
+            min_compat=$(jq -r '.min_compat_version // "0.0.0"' release_config.json)
+            tier=$(jq -r '.tier_required // "free"' release_config.json)
 
-            # Hash the MINIFIED files: that's what the Pico downloads and
-            # verifies, so the manifest checksum must match the on-wire bytes.
             files=$(
               cd dist
               for f in *.py; do
@@ -204,38 +205,24 @@ jobs:
                }' > MANIFEST.json
           fi
 
-          # Print the manifest into the job log so PR reviewers can sanity-
-          # check it without downloading the artifact.
           echo "::group::MANIFEST.json"
           cat MANIFEST.json
           echo "::endgroup::"
 
-      - name: Upload build artifacts (for PR / branch builds)
-        # Skip the upload on a tag push -- the Release step below already
-        # attaches the same files to the release, no need to keep two copies.
-        if: steps.derive_version.outputs.is_release != 'true'
-        uses: actions/upload-artifact@v4
+      - name: Create tag and GitHub Release
+        # softprops/action-gh-release creates the tag (pointed at the
+        # current commit) AND the release in one atomic operation. If
+        # we'd done `git tag && git push` ourselves, a failure between
+        # the two would leave the repo in a half-released state.
+        if: steps.tag_check.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
         with:
-          name: firmware-${{ steps.derive_version.outputs.version }}
-          path: |
-            MANIFEST.json
-            dist/*.py
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Create GitHub Release
-        # Only on a tag push -- a PR (especially from a fork) doesn't have
-        # write access to contents anyway, but the explicit gate makes the
-        # intent unmistakable and prevents accidental releases from a main
-        # branch push that happens to include "v1.2.3" in a commit message.
-        if: steps.derive_version.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ steps.derive_version.outputs.version }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
           body_path: RELEASE_NOTES.md
           # Upload the minified files (flat filenames -- Pico expects
           # main.py, not dist/main.py, when it fetches release assets).
           files: |
             MANIFEST.json
             dist/*.py
+          fail_on_unmatched_files: true
