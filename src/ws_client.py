@@ -169,6 +169,18 @@ class WebSocketClient:
         self._reconnect_delay = 1  # Start at 1 second
         self._max_reconnect_delay = 60  # Cap at 60 seconds
         self._reconnect_attempts = 0
+        # === HTTP redirect handling on the WS upgrade ===
+        # Some edges (e.g. an HTTPS-only nginx in front of Traefik) return
+        # 301/302/307/308 with a Location header when a Pico is provisioned
+        # with ws:// against a server that only accepts wss://. Browsers
+        # don't follow redirects on a WS upgrade, but for an embedded
+        # device that has no other way to discover the right URL it's
+        # the friendly thing to do -- otherwise a single misprovisioned
+        # secrets.json takes the device offline forever.
+        #
+        # We cap the chain at MAX_REDIRECTS to make any loop fail fast
+        # rather than spinning the radio.
+        self._max_redirects = 3
 
     def _parse_url(self, url):
         """
@@ -183,7 +195,7 @@ class WebSocketClient:
         In regular Python, you'd use `urllib.parse.urlparse()`. MicroPython
         doesn't have that module, so we parse the URL by hand.
         """
-        use_ssl = url.startswith("wss://")
+        use_ssl = url.startswith("wss://") or url.startswith("https://")
         # Strip the scheme (ws:// or wss://).
         url = url.replace("wss://", "").replace("ws://", "")
         # if the server url starts with http:// or https://, remove that as well
@@ -217,6 +229,8 @@ class WebSocketClient:
         2. TCP connection (3-way handshake)
         3. TLS handshake (if wss://, negotiate encryption)
         4. WebSocket upgrade handshake (HTTP upgrade request)
+        5. If the server replies with 301/302/307/308 + Location, retarget
+           and try again (up to self._max_redirects hops total).
 
         Returns True if connected, False if any step failed.
 
@@ -237,6 +251,61 @@ class WebSocketClient:
 
         After this, the connection is "upgraded" from HTTP to WebSocket,
         and both sides can send frames freely.
+        """
+        # Snapshot the originally-requested URL so a failed redirect chain
+        # can restore it -- otherwise self._url would be left pointing at
+        # whatever URL we last tried, which is misleading on next retry.
+        original_url = self._url
+        original_state = (self._host, self._port, self._path, self._use_ssl)
+
+        for attempt in range(self._max_redirects + 1):
+            result = self._handshake_once()
+            if result is True:
+                return True
+            if isinstance(result, str):
+                # Redirect: result is the new absolute URL to try.
+                if attempt >= self._max_redirects:
+                    print(
+                        "[ws] Too many redirects (",
+                        attempt + 1,
+                        "); giving up",
+                    )
+                    break
+                print(
+                    "[ws] Following redirect ->",
+                    result,
+                    "(",
+                    self._max_redirects - attempt,
+                    "remaining )",
+                )
+                # Retarget. _parse_url already promotes http:// -> ws:// and
+                # https:// -> wss:// because we strip those schemes too.
+                # _normalize_redirect_target adds the explicit promotion so
+                # the use_ssl flag is right when the redirect uses http(s).
+                new_url = self._normalize_redirect_target(result)
+                self._url = new_url
+                self._host, self._port, self._path, self._use_ssl = (
+                    self._parse_url(new_url)
+                )
+                continue
+            # result is False (or anything else) -> hard failure, no retry.
+            break
+
+        # Restore original URL so callers / logs see the configured target.
+        self._url = original_url
+        self._host, self._port, self._path, self._use_ssl = original_state
+        return False
+
+    def _handshake_once(self):
+        """
+        One TCP+TLS+WebSocket-upgrade attempt against the current URL.
+
+        Returns:
+            True            -> upgrade succeeded; self._sock is a live WS.
+            <str>           -> server replied with a 3xx redirect; the str
+                               is the absolute URL from the Location header.
+                               Caller should retarget and try again.
+            False           -> hard failure (DNS, TLS, non-3xx non-101, etc).
         """
         print(
             "[ws] Connecting to",
@@ -337,30 +406,123 @@ class WebSocketClient:
                     return False
                 response += chunk
 
-            # Check that the server accepted the upgrade.
-            # We look for "101" status code (Switching Protocols).
+            # Check the server's response. The good outcome is 101 Switching
+            # Protocols. Anything else is either a redirect we can chase or
+            # a hard failure.
             response_line = response.split(b"\r\n")[0]
-            if b"101" not in response_line:
-                print("[ws] Handshake failed:", response_line)
+            status_code = self._parse_status_code(response_line)
+
+            if status_code == 101:
+                # Success! The connection is now a WebSocket.
+                self._connected = True
+                self._reconnect_delay = 1  # Reset backoff on successful connect.
+                self._reconnect_attempts = 0
+                self._last_pong_time = time.ticks_ms()
+
+                # Set a short timeout for non-blocking receives in the main loop.
+                self._sock.settimeout(0.1)
+
+                print("[ws] Connected!")
+                return True
+
+            if status_code in (301, 302, 307, 308):
+                # 301/308 = permanent, 302/307 = temporary. We follow either
+                # the same way; the only difference would be whether to
+                # persist the new URL to secrets.json, which we deliberately
+                # don't do here -- silently rewriting flash on the basis of
+                # one server response is too easy to abuse. If you see this
+                # log line repeatedly, re-provision with the new URL.
+                location = self._parse_location_header(response)
                 self._close_socket()
+                if location:
+                    print(
+                        "[ws] Got",
+                        status_code,
+                        "redirect (",
+                        "permanent" if status_code in (301, 308) else "temporary",
+                        ") to:",
+                        location,
+                    )
+                    return location
+                print(
+                    "[ws] Got",
+                    status_code,
+                    "redirect but no Location header; giving up",
+                )
                 return False
 
-            # Success! The connection is now a WebSocket.
-            self._connected = True
-            self._reconnect_delay = 1  # Reset backoff on successful connect.
-            self._reconnect_attempts = 0
-            self._last_pong_time = time.ticks_ms()
-
-            # Set a short timeout for non-blocking receives in the main loop.
-            self._sock.settimeout(0.1)
-
-            print("[ws] Connected!")
-            return True
+            print("[ws] Handshake failed:", response_line)
+            self._close_socket()
+            return False
 
         except Exception as e:
             print("[ws] Connection failed:", e)
             self._close_socket()
             return False
+
+    @staticmethod
+    def _parse_status_code(response_line):
+        """
+        Extract the integer status code from "HTTP/1.1 <code> <reason>".
+        Returns None if the line is malformed.
+        """
+        try:
+            parts = response_line.split(b" ", 2)
+            if len(parts) < 2:
+                return None
+            return int(parts[1])
+        except (ValueError, IndexError):
+            return None
+
+    def _parse_location_header(self, response):
+        """
+        Pull the value of the Location header out of a raw HTTP response.
+        The header name is case-insensitive per RFC 7230, so we lowercase
+        before comparing. Handles relative-path Location values by
+        resolving them against the current host/scheme.
+        """
+        try:
+            text = response.decode("utf-8", "replace")
+        except Exception:
+            return None
+        for line in text.split("\r\n"):
+            # Skip the status line and the empty line before the body.
+            if not line or ":" not in line:
+                continue
+            name, _, value = line.partition(":")
+            if name.strip().lower() == "location":
+                target = value.strip()
+                if not target:
+                    return None
+                # Absolute URL -> return as-is.
+                if "://" in target:
+                    return target
+                # Relative URL. Build an absolute one against the current
+                # connection so the next attempt has a complete target.
+                scheme = "wss" if self._use_ssl else "ws"
+                if target.startswith("/"):
+                    return "{0}://{1}:{2}{3}".format(
+                        scheme, self._host, self._port, target
+                    )
+                # Path-relative (rare). Reuse the directory of self._path.
+                base = self._path.rsplit("/", 1)[0] + "/"
+                return "{0}://{1}:{2}{3}{4}".format(
+                    scheme, self._host, self._port, base, target
+                )
+        return None
+
+    @staticmethod
+    def _normalize_redirect_target(url):
+        """
+        Servers commonly redirect to http:// or https:// even though the
+        original request was a WebSocket upgrade. Promote those schemes to
+        ws:// / wss:// so _parse_url picks the right port and TLS flag.
+        """
+        if url.startswith("https://"):
+            return "wss://" + url[len("https://"):]
+        if url.startswith("http://"):
+            return "ws://" + url[len("http://"):]
+        return url
 
     def send(self, data):
         """
