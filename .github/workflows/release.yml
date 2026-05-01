@@ -1,4 +1,4 @@
-# Build a MANIFEST.json from src/ and cut a GitHub Release on tag push.
+# Build a MANIFEST.json from src/ and (on a tag push) cut a GitHub Release.
 #
 # When you push a tag like `v0.2.1`, this workflow:
 #  1. Reads release_config.json for min_compat_version + tier_required.
@@ -7,6 +7,17 @@
 #  4. Creates a GitHub Release using RELEASE_NOTES.md as the body.
 #  5. Attaches MANIFEST.json and all src/*.py as release assets.
 #
+# On a pull request (or push to main), the same build runs WITHOUT cutting
+# a release -- the workflow validates that:
+#   - python-minifier still accepts every src/*.py,
+#   - release_config.json parses,
+#   - MANIFEST.json can be assembled,
+#   - RELEASE_NOTES.md exists.
+# The minified files + manifest are uploaded as workflow artifacts so a
+# reviewer can download them from the PR's "Checks" tab. URLs in the PR
+# manifest point at a tag that doesn't exist yet -- that's expected; we're
+# only verifying the shape, not publishing.
+#
 # To change min_compat_version or tier_required for a release:
 #   edit release_config.json, commit, then push the tag.
 #
@@ -14,19 +25,37 @@
 #   edit RELEASE_NOTES.md, commit, then push the tag.
 #   The file is overwritten each release -- it always reflects the latest.
 
-name: Release firmware
+name: Build & release firmware
 
 on:
   push:
     tags:
       - 'v*.*.*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
+# Top-level permissions are the union of what any job might need.
+# The Release step is gated by `if:` below, so PRs (which GitHub already
+# downgrades to read-only for forks) never actually exercise `contents: write`.
 permissions:
   contents: write
 
+# Group concurrent runs per ref so a rapid sequence of PR pushes cancels
+# in-flight builds instead of queuing them. Tag releases keep their own
+# group (they should never be cancelled).
+concurrency:
+  group: firmware-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive_version.outputs.version }}
+      is_release: ${{ steps.derive_version.outputs.is_release }}
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -35,6 +64,49 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+
+      - name: Derive version + release flag
+        id: derive_version
+        # On a tag push, version is the tag without the leading "v" and we
+        # set is_release=true so the Release step downstream fires. On any
+        # other event (PR, push to main), we tag the manifest as
+        # "dev-<short sha>" so it's obviously not a real release if anyone
+        # downloads the artifact.
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            is_release=true
+          else
+            version="dev-${GITHUB_SHA::7}"
+            is_release=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+          echo "Building $version (release=$is_release, event=${GITHUB_EVENT_NAME})"
+
+      - name: Validate required files
+        # Catch missing files early on a PR so a tag push doesn't fail
+        # halfway through. RELEASE_NOTES.md is the GitHub Release body, so
+        # it must exist by tag time -- enforce that on every PR too.
+        run: |
+          set -euo pipefail
+          for f in RELEASE_NOTES.md release_config.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing required file: $f"
+              exit 1
+            fi
+          done
+          # release_config.json must at least parse; the build step pulls
+          # min_compat_version + tier_required out with safe defaults so
+          # missing keys are tolerated, but malformed JSON is not.
+          jq empty release_config.json
+          # If a hand-crafted MANIFEST.json is committed, validate that it
+          # at least parses too (the manifest step will use it as-is).
+          if [ -f MANIFEST.json ]; then
+            jq empty MANIFEST.json
+          fi
 
       - name: Minify Python sources for flash
         # The src/*.py files carry heavy educational comments + docstrings
@@ -75,11 +147,20 @@ jobs:
             "TOTAL" "$total_src" "$total_dist" "$total_pct"
 
       - name: Build MANIFEST.json
-        id: manifest
+        # On a tag push, ${tag} resolves to the actual ref and the URLs
+        # baked into the manifest will resolve once the release is created
+        # below. On a PR or branch push, ${tag} is "v<dev-version>" which
+        # won't exist as a release; that's fine because we don't ship the
+        # PR manifest anywhere -- it's only an artifact for inspection.
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
+          version="${{ steps.derive_version.outputs.version }}"
+          is_release="${{ steps.derive_version.outputs.is_release }}"
+          if [ "$is_release" = "true" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="v${version}"
+          fi
           repo="${GITHUB_REPOSITORY}"
           base_url="https://github.com/${repo}/releases/download/${tag}"
 
@@ -123,13 +204,35 @@ jobs:
                }' > MANIFEST.json
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Print the manifest into the job log so PR reviewers can sanity-
+          # check it without downloading the artifact.
+          echo "::group::MANIFEST.json"
+          cat MANIFEST.json
+          echo "::endgroup::"
+
+      - name: Upload build artifacts (for PR / branch builds)
+        # Skip the upload on a tag push -- the Release step below already
+        # attaches the same files to the release, no need to keep two copies.
+        if: steps.derive_version.outputs.is_release != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.derive_version.outputs.version }}
+          path: |
+            MANIFEST.json
+            dist/*.py
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Create GitHub Release
+        # Only on a tag push -- a PR (especially from a fork) doesn't have
+        # write access to contents anyway, but the explicit gate makes the
+        # intent unmistakable and prevents accidental releases from a main
+        # branch push that happens to include "v1.2.3" in a commit message.
+        if: steps.derive_version.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: ${{ steps.manifest.outputs.version }}
+          name: ${{ steps.derive_version.outputs.version }}
           body_path: RELEASE_NOTES.md
           # Upload the minified files (flat filenames -- Pico expects
           # main.py, not dist/main.py, when it fetches release assets).
