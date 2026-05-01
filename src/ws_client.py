@@ -343,11 +343,9 @@ class WebSocketClient:
             # socket.SOCK_STREAM = TCP (as opposed to SOCK_DGRAM for UDP)
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-            # Set a timeout for socket operations.
-            # Without this, a recv() call would block forever if no data arrives.
-            # With a timeout of 0.1 seconds, recv() will raise OSError(ETIMEDOUT)
-            # if no data arrives within that time, allowing our main loop to
-            # continue doing other things.
+            # Set a generous timeout for connect + handshake so we don't
+            # hang for two minutes on an unreachable host. Same pattern as
+            # ota_updater.py, ping.py, network_scanner.py, tcp_relay.py.
             self._sock.settimeout(5)
 
             # Connect to the server. This performs the TCP 3-way handshake:
@@ -419,7 +417,8 @@ class WebSocketClient:
                 self._reconnect_attempts = 0
                 self._last_pong_time = time.ticks_ms()
 
-                # Set a short timeout for non-blocking receives in the main loop.
+                # Short timeout for steady-state recv. Same pattern the rest
+                # of the firmware uses (e.g. tcp_relay.py: settimeout(0.05)).
                 self._sock.settimeout(0.1)
 
                 print("[ws] Connected!")

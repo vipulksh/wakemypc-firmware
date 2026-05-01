@@ -1,0 +1,144 @@
+# Firmware CI -- validation that runs on every PR (and on push to main as a
+# safety net for direct pushes). Anything we'd want to catch BEFORE merge
+# lives here; the release workflow only does release work.
+#
+# Checks:
+#   1. Required files (RELEASE_NOTES.md, release_config.json) exist and parse.
+#   2. The first heading of RELEASE_NOTES.md is a parseable "## vX.Y.Z".
+#   3. FIRMWARE_VERSION in src/main.py matches that release-notes version.
+#      This catches the easy mistake of bumping RELEASE_NOTES.md but
+#      forgetting to update the constant the firmware reports back to the
+#      server -- a Pico that says it's running v0.3.6 while flashed with
+#      v0.3.7 makes OTA + diagnostics lie.
+#   4. Every src/*.py compiles (python syntax check).
+#   5. python-minifier accepts every src/*.py with the same flags the
+#      release workflow uses, so a release won't blow up at minify time
+#      after a PR is already merged.
+#
+# Why a separate file from release.yml?
+#   "Release on merge" should be a release workflow, not a CI workflow.
+#   PRs need cheap iterative feedback while they're open, and that
+#   shouldn't share a YAML file with the publish step. Splitting also
+#   makes it obvious which checks block a PR (this file's failure)
+#   vs. which are end-of-pipeline release steps.
+
+name: Firmware CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# CI runs are read-only; keep the token scoped accordingly so a compromised
+# action can't push tags or content.
+permissions:
+  contents: read
+
+# A new push to a PR cancels the previous CI run for that PR -- there's no
+# point validating an obsolete commit. Push events to main don't cancel
+# (different group key), so the post-merge safety-net run always completes.
+concurrency:
+  group: firmware-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Required files exist and parse
+        run: |
+          set -euo pipefail
+          for f in RELEASE_NOTES.md release_config.json src/main.py; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::missing required file"
+              exit 1
+            fi
+          done
+          jq empty release_config.json
+          if [ -f MANIFEST.json ]; then
+            jq empty MANIFEST.json
+          fi
+
+      - name: Parse release-notes version
+        id: notes_version
+        # Same regex the release workflow uses. Allows pre-release suffixes
+        # like v1.2.3-rc1.
+        run: |
+          set -euo pipefail
+          version=$(
+            grep -m1 -oE '^##[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?' RELEASE_NOTES.md \
+              | sed -E 's/^##[[:space:]]+v//'
+          ) || true
+          if [ -z "${version:-}" ]; then
+            echo "::error file=RELEASE_NOTES.md::could not parse '## v<X.Y.Z>' from the first heading"
+            head -n 5 RELEASE_NOTES.md
+            exit 1
+          fi
+          echo "RELEASE_NOTES.md says: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: FIRMWARE_VERSION in src/main.py matches RELEASE_NOTES.md
+        # The firmware reports its version to the server (see main.py:340)
+        # and the OTA path uses it to compare against the latest release
+        # manifest. If the constant drifts from the release-notes heading,
+        # OTA decisions and admin-dashboard diagnostics start lying. Block
+        # the merge here.
+        run: |
+          set -euo pipefail
+          notes="${{ steps.notes_version.outputs.version }}"
+          # Match: FIRMWARE_VERSION = "X.Y.Z" with single OR double quotes,
+          # any leading whitespace, optional spaces around the =.
+          firmware=$(
+            grep -m1 -oE '^[[:space:]]*FIRMWARE_VERSION[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' src/main.py \
+              | sed -E 's/.*=[[:space:]]*["'"'"']([^"'"'"']+)["'"'"'].*/\1/'
+          ) || true
+          if [ -z "${firmware:-}" ]; then
+            echo "::error file=src/main.py::could not find FIRMWARE_VERSION = \"X.Y.Z\" line"
+            exit 1
+          fi
+          echo "src/main.py FIRMWARE_VERSION : $firmware"
+          echo "RELEASE_NOTES.md heading     : $notes"
+          if [ "$firmware" != "$notes" ]; then
+            echo "::error file=src/main.py::FIRMWARE_VERSION ($firmware) does not match RELEASE_NOTES.md ($notes). Bump one of them so they agree."
+            exit 1
+          fi
+          echo "Versions agree."
+
+      - name: Python syntax-compile every src/*.py
+        # Cheap fast-fail before the minifier; py_compile gives a precise
+        # "line N: SyntaxError" message that python-minifier swallows.
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in src/*.py; do
+            [ -f "$f" ] || continue
+            if ! python -m py_compile "$f"; then
+              echo "::error file=$f::syntax error"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+      - name: python-minifier accepts every src/*.py
+        # Mirror the release workflow's flags exactly so anything that
+        # works here also works at release time. We discard the output --
+        # CI only cares that the minifier doesn't error on parse.
+        run: |
+          set -euo pipefail
+          pip install --quiet python-minifier
+          for f in src/*.py; do
+            [ -f "$f" ] || continue
+            python -m python_minifier --remove-literal-statements "$f" > /dev/null
+          done
+          echo "All ${#} src/*.py minify cleanly."
