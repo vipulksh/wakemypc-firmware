@@ -1,15 +1,21 @@
-# Cut a GitHub Release every time a PR merges to main with a new version.
+# Cut a GitHub Release every time main advances to a version that doesn't
+# yet have a tag.
 #
 # The version comes from the FIRST heading of RELEASE_NOTES.md, which must
 # look like:
 #
 #     ## v0.3.6 — Fix handling of redirects by `ws_client.py`
 #
-# The workflow:
-#   1. Triggers on push to main (i.e. PR-merge or direct push).
+# All input validation (RELEASE_NOTES heading parses, FIRMWARE_VERSION in
+# src/main.py matches, src/*.py compiles, etc.) lives in the separate CI
+# workflow (.github/workflows/ci.yml) and is required to pass on the PR
+# before merge. By the time we get here those invariants already hold, so
+# this workflow only does release work:
+#
+#   1. Triggers on push to main (PR-merge or direct push) + workflow_dispatch.
 #   2. Parses "v<X.Y.Z>" from the first heading of RELEASE_NOTES.md.
-#   3. If a tag for that version already exists, exits cleanly (idempotent --
-#      re-running the workflow on the same merge does nothing).
+#   3. If a tag for that version already exists, exits cleanly (idempotent
+#      re-runs of the same merge do nothing).
 #   4. Minifies src/*.py into dist/*.py.
 #   5. Builds MANIFEST.json from release_config.json + the minified files.
 #   6. Calls softprops/action-gh-release, which atomically creates the
@@ -17,20 +23,10 @@
 #      Release (with RELEASE_NOTES.md as the body, MANIFEST.json + dist/*.py
 #      as assets).
 #
-# Why no PR-CI trigger here?
-#   This is the *release* workflow. Building + tagging on every PR-open is
-#   the wrong shape -- if you want CI on PRs (linting, syntax checks, etc),
-#   wire that up in a separate workflow file. Mixing release publication
-#   logic into PR-open events is how repos accidentally cut releases from
-#   feature branches.
-#
 # To bump the version:
 #   In your PR, change the first heading of RELEASE_NOTES.md to the new
-#   version (e.g. "## v0.3.7 — ..."). When the PR merges, that's the tag
-#   that gets created.
-#
-# To change min_compat_version or tier_required:
-#   Edit release_config.json and commit alongside the RELEASE_NOTES bump.
+#   version AND update FIRMWARE_VERSION in src/main.py to the same value.
+#   CI will fail the PR if those two drift apart, so you can't forget.
 
 name: Release firmware
 
@@ -60,35 +56,27 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
         with:
-          # We need the full tag list to detect "already-released versions"
-          # in the skip step below. Default fetch-depth=1 doesn't fetch tags.
+          # Need the full tag list to detect already-released versions in
+          # the skip step below. Default fetch-depth=1 doesn't fetch tags.
           fetch-depth: 0
 
       - name: Parse version from RELEASE_NOTES.md
         id: version
-        # Look at the first non-blank line that starts with "## v<digits>"
-        # and pull the bare version out. Anything else (forgot to bump,
-        # malformed heading, missing file) is a hard error -- we'd rather
-        # fail loudly than silently skip a release the author expected.
         run: |
           set -euo pipefail
-          if [ ! -f RELEASE_NOTES.md ]; then
-            echo "::error::RELEASE_NOTES.md is missing"
-            exit 1
-          fi
-          # Match "## vX.Y.Z" anywhere in the leading whitespace of a line.
-          # The pattern allows pre-release suffixes like v1.2.3-rc1 too.
           version=$(
             grep -m1 -oE '^##[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?' RELEASE_NOTES.md \
               | sed -E 's/^##[[:space:]]+v//'
           ) || true
           if [ -z "${version:-}" ]; then
-            echo "::error::could not parse 'v<X.Y.Z>' from the first heading of RELEASE_NOTES.md"
-            echo "first 5 lines were:"
+            # CI should have caught this, but defend in depth in case the
+            # release workflow runs without CI (workflow_dispatch on a
+            # branch that skipped review).
+            echo "::error file=RELEASE_NOTES.md::could not parse '## v<X.Y.Z>' from the first heading"
             head -n 5 RELEASE_NOTES.md
             exit 1
           fi
-          echo "Parsed version: $version"
+          echo "Releasing version: $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version"   >> "$GITHUB_OUTPUT"
 
@@ -97,7 +85,7 @@ jobs:
         # Idempotent re-run guard. If the version in RELEASE_NOTES.md
         # already has a tag (e.g. someone re-ran this workflow without
         # bumping), we exit success without doing anything else. The next
-        # bump will trigger a fresh release.
+        # bump triggers a fresh release.
         run: |
           set -euo pipefail
           tag="${{ steps.version.outputs.tag }}"
@@ -114,19 +102,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
-      - name: Validate release_config.json
-        if: steps.tag_check.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          if [ ! -f release_config.json ]; then
-            echo "::error::release_config.json is missing"
-            exit 1
-          fi
-          jq empty release_config.json
-          if [ -f MANIFEST.json ]; then
-            jq empty MANIFEST.json
-          fi
 
       - name: Minify Python sources for flash
         if: steps.tag_check.outputs.skip != 'true'
@@ -178,7 +153,6 @@ jobs:
             # express. The file is attached to the release unchanged.
             echo "Using committed MANIFEST.json (manual override)"
           else
-            # Auto-generate from dist/*.py (minified flash payload).
             min_compat=$(jq -r '.min_compat_version // "0.0.0"' release_config.json)
             tier=$(jq -r '.tier_required // "free"' release_config.json)
 
@@ -220,8 +194,6 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.version }}
           body_path: RELEASE_NOTES.md
-          # Upload the minified files (flat filenames -- Pico expects
-          # main.py, not dist/main.py, when it fetches release assets).
           files: |
             MANIFEST.json
             dist/*.py

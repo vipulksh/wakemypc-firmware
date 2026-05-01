@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.3.5"
+FIRMWARE_VERSION = "0.4.0"
 
 
 # -------------------------------------------------------------------------
@@ -550,6 +550,14 @@ def main():
                 # somewhere (the last printed phase says where).
                 tick_now = time.ticks_ms()
                 if time.ticks_diff(tick_now, last_tick_log) >= 5000:
+                    # Collect before sampling free RAM. Without this, short-lived
+                    # objects from recv(), JSON decoding, and print() wrappers
+                    # accumulate as uncollected garbage and make free_ram read
+                    # artificially low. The heartbeat also calls gc.collect(), so
+                    # the two samples would bracket a GC cycle and show wildly
+                    # different numbers (e.g. 185KB vs 316KB) for the same steady
+                    # state. Collecting here first gives a stable, accurate reading.
+                    gc.collect()
                     print(
                         "[main] tick | iter=",
                         iter_count,
