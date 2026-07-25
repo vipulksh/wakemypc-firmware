@@ -87,7 +87,7 @@ from watchdog import WatchdogManager
 # -------------------------------------------------------------------------
 # Increment this when you release a new version.
 # The server can check this to know if an OTA update is needed.
-FIRMWARE_VERSION = "0.4.0"
+FIRMWARE_VERSION = "0.4.1"
 
 
 # -------------------------------------------------------------------------
@@ -239,9 +239,12 @@ def boot(reuse=None):
                 "ws": None,
                 "proto": None,
             }
-
-        # Try to connect. This tries each SSID in order with timeouts.
-        wifi_connected = wifi.connect(wifi_networks)
+        if wifi.is_connected():
+            print("[boot] WiFi already connected. Reusing existing connection.")
+            wifi_connected = True
+        else:
+            # Try to connect. This tries each SSID in order with timeouts.
+            wifi_connected = wifi.connect(wifi_networks)
 
         if not wifi_connected:
             print("[boot] WiFi connection failed!")

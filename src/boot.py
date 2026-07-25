@@ -83,14 +83,15 @@ try:
     from wifi_manager import WiFiManager
 
     config = Config()
-    wifi = WiFiManager(config)
+    config.load()  # Load secrets.json (WiFi credentials, device token)
+    wifi = WiFiManager()
 
     networks = config.get("wifi_networks", [])
     if networks:
         print(f"Attempting WiFi connection ({len(networks)} networks configured)...")
         # Quick attempt with short timeout -- don't block boot for too long.
         # main.py will retry with longer timeouts and exponential backoff.
-        connected = wifi.connect(timeout=10)
+        connected = wifi.connect(networks)
         if connected:
             print(f"WiFi connected: {wifi.get_info()}")
             led.off()  # LED off = WiFi connected (main.py will set its own pattern)
