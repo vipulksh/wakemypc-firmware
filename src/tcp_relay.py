@@ -108,13 +108,10 @@ class TCPRelay:
     # transfers can be larger. 1024 bytes is a good balance.
     READ_BUFFER_SIZE = 1024
 
-    def __init__(self, ws_client):
+    def __init__(self):
         """
-        Parameters:
-            ws_client: The WebSocketClient instance for sending data to the server.
+        Initialize the TCP relay manager.
         """
-        self._ws = ws_client
-
         # Active sessions: {session_id: socket_object}
         self._sessions = {}
 
@@ -344,7 +341,7 @@ def handle_tcp_relay_open(message, proto):
     # Get or create the relay instance.
     # We store it on the proto object so it persists across messages.
     if not hasattr(proto, "_tcp_relay"):
-        proto._tcp_relay = TCPRelay(proto._ws)
+        proto._tcp_relay = TCPRelay()
 
     success = proto._tcp_relay.open_session(session_id, host, port)
     proto.send_response(

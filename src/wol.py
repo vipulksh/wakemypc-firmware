@@ -285,18 +285,17 @@ def handle_wol(message, proto):
 
     # Send the magic packet multiple times.
     result = None
-    for i in range(count):
+    for _ in range(count):
         result = send_magic_packet(mac, broadcast_addr=broadcast)
         if not result["success"]:
             break  # Stop if there's an error (e.g., invalid MAC).
-        if i < count - 1:
-            # Small delay between sends (100ms).
-            # time.sleep_ms() is a MicroPython-specific function that sleeps
-            # for the given number of milliseconds.
-            try:
-                time.sleep_ms(100)
-            except AttributeError:
-                time.sleep(0.1)
+        # Small delay between sends (200ms).
+        # time.sleep_ms() is a MicroPython-specific function that sleeps
+        # for the given number of milliseconds.
+        try:
+            time.sleep_ms(200)
+        except AttributeError:
+            time.sleep(0.2)
 
     if result:
         result["packets_sent"] = count

@@ -551,14 +551,10 @@ class WebSocketClient:
                 # connection so the next attempt has a complete target.
                 scheme = "wss" if self._use_ssl else "ws"
                 if target.startswith("/"):
-                    return "{0}://{1}:{2}{3}".format(
-                        scheme, self._host, self._port, target
-                    )
+                    return f"{scheme}://{self._host}:{self._port}{target}"
                 # Path-relative (rare). Reuse the directory of self._path.
                 base = self._path.rsplit("/", 1)[0] + "/"
-                return "{0}://{1}:{2}{3}{4}".format(
-                    scheme, self._host, self._port, base, target
-                )
+                return f"{scheme}://{self._host}:{self._port}{base}{target}"
         return None
 
     @staticmethod
@@ -773,6 +769,8 @@ class WebSocketClient:
                 # Ping frame -- server is checking if we're alive.
                 # We MUST respond with a pong containing the same payload.
                 self._send_pong(payload)
+                # Update the last pong time to avoid false dead connection detection.
+                self._last_pong_time = time.ticks_ms()
                 return None
 
             elif opcode == 0xA:

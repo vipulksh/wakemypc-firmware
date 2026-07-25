@@ -319,7 +319,7 @@ def boot(reuse=None):
 
     # Store LED and TCP relay references on proto so handlers can access them.
     proto._led = led
-    proto._tcp_relay = TCPRelay(ws)
+    proto._tcp_relay = TCPRelay()
 
     # ------------------------------------------------------------------
     # Step 6: Authenticate with Server
