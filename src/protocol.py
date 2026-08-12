@@ -239,7 +239,7 @@ class ProtocolHandler:
 
         Example:
             # In wol.py:
-            def handle_wol(message, proto):
+            def handle_wol(message, proto: ProtocolHandler):
                 mac = message.get("mac")
                 success = send_magic_packet(mac)
                 proto.send_response("wol_result", {"success": success, "mac": mac})
@@ -411,7 +411,7 @@ class ProtocolHandler:
     # Built-in Handlers
     # =====================================================================
 
-    def _handle_ping(self, message, proto):
+    def _handle_ping(self, message, proto: ProtocolHandler):
         """
         Handle application-level ping.
 
@@ -424,7 +424,7 @@ class ProtocolHandler:
         """
         proto.send_response("pong")
 
-    def _handle_auth_ok(self, message, proto):
+    def _handle_auth_ok(self, message, proto: ProtocolHandler):
         """
         Server confirms successful WebSocket auth and hands us our identity
         and monitoring list.
@@ -471,7 +471,7 @@ class ProtocolHandler:
                 # Don't let a buggy callback crash the firmware; just log.
                 print("[proto] on_auth_ok callback raised:", exc)
 
-    def _handle_pong(self, message, proto):
+    def _handle_pong(self, message, proto: ProtocolHandler):
         """
         Server's reply to one of our heartbeats. Nothing to do -- the
         liveness timestamp was already bumped in dispatch() before we got
@@ -482,7 +482,7 @@ class ProtocolHandler:
         # No-op. Intentional.
         pass
 
-    def _handle_device_assignment(self, message, proto):
+    def _handle_device_assignment(self, message, proto: ProtocolHandler):
         """
         Server pushed an updated list of devices this Pico should
         monitor. Replace our in-memory list. main.py's periodic
@@ -507,7 +507,7 @@ class ProtocolHandler:
             except Exception as exc:
                 print("[proto] on_device_assignment callback raised:", exc)
 
-    def _handle_firmware_update_available(self, message, proto):
+    def _handle_firmware_update_available(self, message, proto: ProtocolHandler):
         """Server has a newer firmware. Log it; the actual OTA arrives
         as a separate ota_update message when the user clicks the
         update button in the dashboard. No reply expected.
@@ -520,7 +520,7 @@ class ProtocolHandler:
             sep="",
         )
 
-    def _handle_auth_fail(self, message, proto):
+    def _handle_auth_fail(self, message, proto: ProtocolHandler):
         """
         Server rejected our auth (bad token, rate-limited, etc.) and is
         about to close the socket.
@@ -562,7 +562,7 @@ class ProtocolHandler:
         """
         self._on_auth_ok = callback
 
-    def _handle_request_heartbeat(self, message, proto):
+    def _handle_request_heartbeat(self, message, proto: ProtocolHandler):
         """
         Server (via the dashboard's "Request heartbeat now" button) is
         asking us to emit a full heartbeat right now instead of waiting
@@ -581,7 +581,7 @@ class ProtocolHandler:
             except Exception as exc:
                 print("[proto] on_request_heartbeat callback raised:", exc)
         # Fallback: bare heartbeat with no health info.
-        self.send_heartbeat()
+        self.send_heartbeat(self._config.get("wifi_info"), None)
 
     def set_on_request_heartbeat(self, callback):
         """
@@ -592,7 +592,7 @@ class ProtocolHandler:
         """
         self._on_request_heartbeat = callback
 
-    def _handle_wifi_config_get(self, message, proto):
+    def _handle_wifi_config_get(self, message, proto: ProtocolHandler):
         """
         Dashboard wants to view the WiFi networks this Pico is configured
         for. Server sends {"type": "wifi_config_get"}; we reply with
@@ -613,9 +613,14 @@ class ProtocolHandler:
                     "password_set": bool(net.get("password")),
                 }
             )
-        proto.send_response("wifi_config", {"networks": sanitized})
+        proto.send_response(
+            "wifi_config", 
+            {   "networks": sanitized, 
+                "message": "No Wifi is configured." if not sanitized else "",
+            }
+        )
 
-    def _handle_wifi_config_set(self, message, proto):
+    def _handle_wifi_config_set(self, message, proto: ProtocolHandler):
         """
         Dashboard pushed a new list of WiFi networks. Replace what we
         have, persist to flash, optionally tell main.py to reconnect.
@@ -713,7 +718,7 @@ class ProtocolHandler:
         """
         self._on_device_assignment = callback
 
-    def _handle_config_update(self, message, proto):
+    def _handle_config_update(self, message, proto: ProtocolHandler):
         """
         Handle remote configuration update.
 
@@ -758,7 +763,7 @@ class ProtocolHandler:
             },
         )
 
-    def _handle_reboot(self, message, proto):
+    def _handle_reboot(self, message, proto: ProtocolHandler):
         """
         Handle reboot request.
 
@@ -780,7 +785,7 @@ class ProtocolHandler:
         print("[proto] Rebooting...")
         hard_reset("server_reboot")
 
-    def _handle_get_status(self, message, proto):
+    def _handle_get_status(self, message, proto: ProtocolHandler):
         """
         Handle status request.
 
